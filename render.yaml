@@ -1,0 +1,32 @@
+# Render Blueprint: creates the CSave backend web service. Secret values are entered in the Render dashboard (sync: false), never stored here.
+services:
+  - type: web
+    name: csave-backend
+    runtime: node
+    plan: starter          # paid plan: stays awake so auto-save and the nightly jobs keep running
+    region: frankfurt      # closest to Nigeria among Render regions
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - { key: NODE_VERSION, value: "20" }
+      - { key: DATABASE_URL, sync: false }
+      - { key: JWT_SECRET, sync: false }
+      - { key: TOKEN_KEY, sync: false }
+      - { key: FLW_SECRET_KEY, sync: false }
+      - { key: FLW_WEBHOOK_HASH, sync: false }
+      - { key: PAYMENT_REDIRECT_URL, sync: false }
+      - { key: PUBLIC_BASE_URL, sync: false }
+      - { key: PAYMENT_BACK_URL, sync: false }
+      - { key: DOJAH_APP_ID, sync: false }
+      - { key: DOJAH_SECRET_KEY, sync: false }
+      - { key: RESEND_API_KEY, sync: false }
+      - { key: EMAIL_FROM, sync: false }
+      - { key: DEEPSEEK_API_KEY, sync: false }
+      - { key: TELEMETRY_KEY, sync: false }
+      - { key: ORIGIN_SECRET, sync: false }
+      - { key: ADMIN_WEB_URL, sync: false }
+      - { key: BYLAWS_URL, sync: false }
+      - { key: ALERT_EMAIL, sync: false }
+      - { key: ALERT_WEBHOOK_URL, sync: false }
