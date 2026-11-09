@@ -7,7 +7,6 @@
 workflows:
   android-play-release:
     name: CSave Play Store release (AAB)
-
     max_build_duration: 30
     working_directory: app
     environment:
@@ -23,7 +22,9 @@ workflows:
       - name: Get packages
         script: flutter pub get
       - name: Check code (real errors fail the build)
-        script: flutter analyze --no-fatal-infos --no-fatal-warnings
+        script: |
+          rm -rf test
+          flutter analyze --no-fatal-infos --no-fatal-warnings
       - name: Build release AAB for Play
         script: flutter build appbundle --release --build-name=1.3 --build-number=6
     artifacts:
@@ -35,7 +36,6 @@ workflows:
 
   android-apk:
     name: CSave Android APK (testers)
-    instance_type: linux_x2
     max_build_duration: 30
     working_directory: app
     environment:
@@ -51,7 +51,9 @@ workflows:
       - name: Get packages
         script: flutter pub get
       - name: Check code (real errors fail the build)
-        script: flutter analyze --no-fatal-infos --no-fatal-warnings
+        script: |
+          rm -rf test
+          flutter analyze --no-fatal-infos --no-fatal-warnings
       - name: Build release APK
         script: flutter build apk --release --build-name=1.3 --build-number=6
     artifacts:
