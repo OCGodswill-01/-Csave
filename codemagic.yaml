@@ -30,10 +30,17 @@ workflows:
         script: python3 tool/codemagic_prepare.py
       - name: Force minSdk 24 for Play automatic protection
         script: |
-          set -e
-          sed -i -E 's/minSdk(Version)?[[:space:]]*=?[[:space:]]*(23|flutter\.minSdkVersion)/minSdk = 24/' android/app/build.gradle
-          grep -n "minSdk" android/app/build.gradle
-          grep -q "minSdk = 24" android/app/build.gradle || { echo "minSdk 24 was NOT applied"; exit 1; }
+          python3 - <<'PY'
+          import re, sys
+          p = 'android/app/build.gradle'
+          s = open(p).read()
+          s, n = re.subn(r'minSdk(?:Version)?\s*=?\s*(?:23|flutter\.minSdkVersion)', 'minSdk = 24', s)
+          open(p, 'w').write(s)
+          print('minSdk lines changed:', n)
+          for line in s.splitlines():
+              if 'minSdk' in line: print(line.strip())
+          if 'minSdk = 24' not in s: sys.exit('minSdk 24 was NOT applied')
+          PY
       - name: Get packages
         script: flutter pub get
       - name: Check code (real errors fail the build)
@@ -59,10 +66,17 @@ workflows:
         script: python3 tool/codemagic_prepare.py
       - name: Force minSdk 24
         script: |
-          set -e
-          sed -i -E 's/minSdk(Version)?[[:space:]]*=?[[:space:]]*(23|flutter\.minSdkVersion)/minSdk = 24/' android/app/build.gradle
-          grep -n "minSdk" android/app/build.gradle
-          grep -q "minSdk = 24" android/app/build.gradle || { echo "minSdk 24 was NOT applied"; exit 1; }
+          python3 - <<'PY'
+          import re, sys
+          p = 'android/app/build.gradle'
+          s = open(p).read()
+          s, n = re.subn(r'minSdk(?:Version)?\s*=?\s*(?:23|flutter\.minSdkVersion)', 'minSdk = 24', s)
+          open(p, 'w').write(s)
+          print('minSdk lines changed:', n)
+          for line in s.splitlines():
+              if 'minSdk' in line: print(line.strip())
+          if 'minSdk = 24' not in s: sys.exit('minSdk 24 was NOT applied')
+          PY
       - name: Get packages
         script: flutter pub get
       - name: Check code (real errors fail the build)
