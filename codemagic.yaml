@@ -16,7 +16,6 @@
 workflows:
   android-play-release:
     name: CSave Play Store release (AAB)
-    instance_type: linux_x2
     max_build_duration: 30
     working_directory: app
     environment:
@@ -46,7 +45,6 @@ workflows:
 
   android-apk:
     name: CSave Android APK (testers)
-    instance_type: linux_x2
     max_build_duration: 30
     working_directory: app
     environment:
