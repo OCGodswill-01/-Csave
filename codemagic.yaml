@@ -1,12 +1,22 @@
-# Codemagic: builds the C'SAVE Android app. Repo root = this csave/ folder (app/ and backend/ inside).
-# In Codemagic: create a variable group named  csave_app  with
-#   API_BASE_URL  = https://your-live-backend-address   (must be https)
-#   TELEMETRY_KEY = same value as TELEMETRY_KEY in the backend .env (optional)
-# And add the upload keystore under Teams -> Code signing identities -> Android keystores,
-#   named  csave_upload_keystore  (alias: upload).
+# C'SAVE - Codemagic build file. Repo root = the csave/ folder (app/ and backend/ inside).
+# Package name: com.abiacsave.app | Version name: 1.3 | Version code: 6
+#
+# Codemagic setup needed (once):
+#   1. Variable group named  csave_app  containing
+#        API_BASE_URL  = https://your-live-backend-address   (must start with https://)
+#        TELEMETRY_KEY = same value as TELEMETRY_KEY in the backend .env (optional)
+#   2. Upload keystore under Teams -> Code signing identities -> Android keystores,
+#      named  csave_upload_keystore  (alias: upload).
+#
+# This file alone fixes the Play Console error "Play automatic protection requires a
+# minimum SDK version of 24 or higher": after the Android project is generated it forces
+# minSdk to 24 and stops the build if that did not apply.
+# If Play says version code 6 is already used, change both build numbers (6 -> 7).
+
 workflows:
   android-play-release:
     name: CSave Play Store release (AAB)
+    instance_type: linux_x2
     max_build_duration: 30
     working_directory: app
     environment:
@@ -19,23 +29,24 @@ workflows:
     scripts:
       - name: Create Android project and apply setup
         script: python3 tool/codemagic_prepare.py
+      - name: Force minSdk 24 for Play automatic protection
+        script: |
+          set -e
+          sed -i -E 's/minSdk(Version)?[[:space:]]*=?[[:space:]]*(23|flutter\.minSdkVersion)/minSdk = 24/' android/app/build.gradle
+          grep -n "minSdk" android/app/build.gradle
+          grep -q "minSdk = 24" android/app/build.gradle || { echo "minSdk 24 was NOT applied"; exit 1; }
       - name: Get packages
         script: flutter pub get
       - name: Check code (real errors fail the build)
-        script: |
-          rm -rf test
-          flutter analyze --no-fatal-infos --no-fatal-warnings
+        script: flutter analyze --no-fatal-infos --no-fatal-warnings
       - name: Build release AAB for Play
         script: flutter build appbundle --release --build-name=1.3 --build-number=6
     artifacts:
       - build/app/outputs/bundle/release/*.aab
-    publishing:
-      email:
-        recipients:
-          - YOUR_EMAIL@example.com
 
   android-apk:
     name: CSave Android APK (testers)
+    instance_type: linux_x2
     max_build_duration: 30
     working_directory: app
     environment:
@@ -48,17 +59,17 @@ workflows:
     scripts:
       - name: Create Android project and apply setup
         script: python3 tool/codemagic_prepare.py
+      - name: Force minSdk 24
+        script: |
+          set -e
+          sed -i -E 's/minSdk(Version)?[[:space:]]*=?[[:space:]]*(23|flutter\.minSdkVersion)/minSdk = 24/' android/app/build.gradle
+          grep -n "minSdk" android/app/build.gradle
+          grep -q "minSdk = 24" android/app/build.gradle || { echo "minSdk 24 was NOT applied"; exit 1; }
       - name: Get packages
         script: flutter pub get
       - name: Check code (real errors fail the build)
-        script: |
-          rm -rf test
-          flutter analyze --no-fatal-infos --no-fatal-warnings
+        script: flutter analyze --no-fatal-infos --no-fatal-warnings
       - name: Build release APK
         script: flutter build apk --release --build-name=1.3 --build-number=6
     artifacts:
       - build/app/outputs/flutter-apk/*.apk
-    publishing:
-      email:
-        recipients:
-          - YOUR_EMAIL@example.com
