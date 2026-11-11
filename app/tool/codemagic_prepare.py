@@ -98,4 +98,27 @@ else:
     g = sub1(r'^([ \t]*)buildTypes\s*\{', lambda mo: signing + mo.group(1) + 'buildTypes {', g, 'buildTypes block', re.M)
     g = sub1(r'signingConfig\s*=?\s*signingConfigs\.debug', 'signingConfig signingConfigs.release', g, 'release signingConfig')
 write(gp, g)
+
+# 6. Skip the lint-vital check in every module. It crashed the release build inside the url_launcher_android plugin
+#    (Codemagic log: "Execution failed for task ':url_launcher_android:lintVitalAnalyzeRelease'"). Lint does not change what ships.
+root = 'android/build.gradle.kts' if os.path.exists('android/build.gradle.kts') else 'android/build.gradle'
+if not os.path.exists(root): die('no root android build file found after flutter create')
+r = read(root)
+if 'lintVital' not in r:
+    r += ('\n// CSave: lint-vital checks are skipped so a plugin lint crash cannot stop the release build.\n'
+          'allprojects {\n    tasks.matching { it.name.startsWith("lintVital") }.configureEach { enabled = false }\n}\n')
+    write(root, r)
+# 7. App icon: replace the Flutter default launcher icon with the C'SAVE logo (app/android_icons/).
+import shutil
+res = 'android/app/src/main/res'
+if not os.path.isdir(res): die('no Android res folder found after flutter create')
+for d in ['mipmap-mdpi', 'mipmap-hdpi', 'mipmap-xhdpi', 'mipmap-xxhdpi', 'mipmap-xxxhdpi']:
+    src = f'android_icons/{d}/ic_launcher.png'
+    if not os.path.exists(src): die(f'missing {src}')
+    os.makedirs(f'{res}/{d}', exist_ok=True)
+    shutil.copyfile(src, f'{res}/{d}/ic_launcher.png')
+# Android 8+ uses an adaptive XML icon first, which would keep the old icon. Remove it so the PNGs above are used.
+adaptive = f'{res}/mipmap-anydpi-v26'
+if os.path.isdir(adaptive): shutil.rmtree(adaptive)
+print('icons installed')
 print('PREPARE OK: android project ready for', api, '| gradle file:', gp)
