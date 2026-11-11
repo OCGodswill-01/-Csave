@@ -176,7 +176,8 @@ const regLimit = mkLimit(15), loginIpLimit = mkLimit(200), loginLimit = mkLimit(
   forgotLimit = mkLimit(6, 15 * 60 * 1000, byEmail), resetLimit = mkLimit(10, 15 * 60 * 1000, byEmail), wdLimit = mkLimit(10, 15 * 60 * 1000, req => 'u' + req.user?.id),
   inviteLookupLimit = mkLimit(30), acceptLimit = mkLimit(10), pwLimit = mkLimit(10, 15 * 60 * 1000, req => 'u' + req.user?.id);
 // Country rule. Cloudflare sets cf-ipcountry; clients cannot fake it IF the server only accepts traffic from Cloudflare.
-// The x-country header is ignored unless TRUST_X_COUNTRY=1 (it is trivial to fake). Allowed list: ALLOWED_COUNTRIES (default NG).
+// The x-country header is ignored unless TRUST_X_COUNTRY=1 (it is trivial to fake).
+// Only Nigeria (NG) is allowed by default. ALLOWED_COUNTRIES on Render can change this (comma list).
 // The check runs on EVERY request, so it follows where the member is now. It no longer leaves a permanent "blocked" flag
 // on the account after one login from abroad. Unknown country (XX) is allowed, so a missing header does not lock everyone out.
 const ALLOWED_COUNTRIES = (process.env.ALLOWED_COUNTRIES || 'NG').split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
