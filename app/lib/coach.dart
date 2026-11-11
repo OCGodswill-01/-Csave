@@ -24,8 +24,8 @@ class _RefState extends State<_ReflectionDialog> {
   final c = TextEditingController(); String? reply, err; bool busy = false;
   Future<void> send() async {
     setState(() { busy = true; err = null; });
-    try { final d = await Api.call('POST', '/api/reflection', {'answer': c.text}); setState(() => reply = d['reply']); }
-    catch (e) { setState(() => err = friendly(e)); }
+    try { final d = await Api.call('POST', '/api/reflection', {'answer': c.text}); if (mounted) setState(() => reply = d['reply']); }
+    catch (e) { if (mounted) setState(() => err = friendly(e)); }
     if (mounted) setState(() => busy = false);
   }
   @override
@@ -70,12 +70,14 @@ class _CoachState extends State<CoachPage> {
   Future<void> send(String text, {String? kind}) async {
     text = text.trim(); if (text.isEmpty || busy) return;
     if (!await ensureAiConsent(context)) { if (mounted) setState(() => err = 'The coach needs your agreement to use AI. Tap send again to read it.'); return; }
+    if (!mounted) return;
     setState(() { msgs.add({'role': 'member', 'text': text}); busy = true; err = null; input.clear(); }); _down();
     try {
       final d = await Api.call('POST', '/api/coach/chat', {'message': text, 'kind': kind});
+      if (!mounted) return;
       setState(() => msgs.add({'role': 'coach', 'text': d['reply']}));
       score = await Api.call('GET', '/api/coach/score');
-    } catch (e) { setState(() => err = friendly(e)); }
+    } catch (e) { if (mounted) setState(() => err = friendly(e)); }
     if (mounted) setState(() => busy = false); _down();
   }
 
