@@ -1,13 +1,12 @@
 # Codemagic: builds the C'SAVE Android app. Repo root = this csave/ folder (app/ and backend/ inside).
 # In Codemagic: create a variable group named  csave_app  with
-#   API_BASE_URL  = https://your-live-backend-address   (must be https)
+#   API_BASE_URL  = https://api.abiacsave.com.ng   (must be https, no trailing slash)
 #   TELEMETRY_KEY = same value as TELEMETRY_KEY in the backend .env (optional)
 # And add the upload keystore under Teams -> Code signing identities -> Android keystores,
 #   named  csave_upload_keystore  (alias: upload).
 workflows:
   android-play-release:
     name: CSave Play Store release (AAB)
-    instance_type: mac_mini_m2
     max_build_duration: 30
     working_directory: app
     environment:
@@ -27,17 +26,12 @@ workflows:
       - name: Check code (real errors fail the build)
         script: flutter analyze --no-fatal-infos --no-fatal-warnings lib
       - name: Build release AAB for Play
-        script: flutter build appbundle --release --build-name=1.3.1 --build-number=8
+        script: flutter build appbundle --release --build-name=1.3.1 --build-number=9
     artifacts:
       - build/app/outputs/bundle/release/*.aab
-    publishing:
-      email:
-        recipients:
-          - YOUR_EMAIL@example.com
 
   android-apk:
     name: CSave Android APK (testers)
-    instance_type: mac_mini_m2
     max_build_duration: 30
     working_directory: app
     environment:
@@ -57,10 +51,6 @@ workflows:
       - name: Check code (real errors fail the build)
         script: flutter analyze --no-fatal-infos --no-fatal-warnings lib
       - name: Build release APK
-        script: flutter build apk --release --build-name=1.3.1 --build-number=8
+        script: flutter build apk --release --build-name=1.3.1 --build-number=9
     artifacts:
       - build/app/outputs/flutter-apk/*.apk
-    publishing:
-      email:
-        recipients:
-          - YOUR_EMAIL@example.com
