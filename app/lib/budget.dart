@@ -453,6 +453,6 @@ class _SettingsState extends State<_Settings> {
             trailing: DropdownButton<int>(value: widget.b['payDay'], items: List.generate(28, (i) => DropdownMenuItem(value: i + 1, child: Text('${i + 1}'))), onChanged: (v) => widget.save({'payDay': v})))),
         Card(child: SwitchListTile(title: const Text('Roll over unspent money'), subtitle: const Text('Money you did not spend moves into the next period'), value: widget.b['rollover'], onChanged: (v) => widget.save({'rollover': v}))),
         Card(child: SwitchListTile(title: const Text('Daily and weekly nudges'), subtitle: const Text('Morning 8:00 plan, night 8:30 check, Sunday 7:00 pm reflection'), value: nudges,
-            onChanged: (v) async { await store.write(key: 'alarms', value: v ? '1' : '0'); setState(() => nudges = v); await Alarms.sync(List.from(await Api.call('GET', '/api/reminders'))); })),
+            onChanged: (v) async { await store.write(key: 'alarms', value: v ? '1' : '0'); if (mounted) setState(() => nudges = v); await Alarms.sync(List.from(await Api.call('GET', '/api/reminders'))); })),
       ]);
 }
