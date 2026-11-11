@@ -30,7 +30,6 @@ class Notify {
   static Future<void> _sched(int id, String title, String body, tz.TZDateTime when, DateTimeComponents match) => _p.zonedSchedule(
       id, title, body, when, _d,
       androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
-      uiLocalNotificationDateInterpretation: UILocalNotificationDateInterpretation.absoluteTime,
       matchDateTimeComponents: match);
 
   /// Repeats every month on [day] (1-28) at "HH:MM".
