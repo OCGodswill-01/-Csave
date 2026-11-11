@@ -1,7 +1,7 @@
 name: csave
 description: CSave - contribute with purpose.
 publish_to: none
-version: 1.3.0+6
+version: 1.3.1+8
 environment:
   sdk: '>=3.0.0 <4.0.0'
 dependencies:
@@ -12,8 +12,8 @@ dependencies:
   local_auth: ^2.3.0
   flutter_secure_storage: ^9.2.2
   url_launcher: ^6.3.0
-  flutter_local_notifications: ^17.2.2
-  timezone: ^0.9.4
+  flutter_local_notifications: ^19.0.0
+  timezone: ^0.10.0
 flutter:
   uses-material-design: true
   assets:
