@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show Platform, SocketException;
+import 'dart:io' show HandshakeException, Platform, SocketException;
 import 'dart:math';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
@@ -30,7 +31,9 @@ String friendly(Object e) {
 }
 
 class Api {
-  static String get base => dotenv.env['API_BASE_URL']!;
+  /// Sent with crash reports so the team knows which build crashed.
+  static const appVersion = '1.3.1+9';
+  static String get base => (dotenv.env['API_BASE_URL'] ?? '').trim().replaceAll(RegExp(r'/+$'), '');
   static const _timeout = Duration(seconds: 25);
 
   /// Set by the app shell: called when the server says the sign-in has expired.
@@ -52,11 +55,17 @@ class Api {
               ? http.delete(uri, headers: h)
               : http.post(uri, headers: h, body: jsonEncode(body ?? {}));
       r = await req.timeout(_timeout);   // never wait forever on a slow network
-    } on TimeoutException {
+    } on TimeoutException catch (e) {
+      debugPrint('API timeout $method $path: $e');
       throw ApiError('This is taking too long. Check your network and try again.');
-    } on SocketException {
+    } on SocketException catch (e) {
+      debugPrint('API socket error $method $path: $e');
       throw ApiError('No internet connection. Check your network and try again.');
-    } on http.ClientException {
+    } on HandshakeException catch (e) {
+      debugPrint('API TLS error $method $path: $e');
+      throw ApiError('Could not open a secure connection. Check your network and try again.');
+    } on http.ClientException catch (e) {
+      debugPrint('API client error $method $path: $e');
       throw ApiError('No internet connection. Check your network and try again.');
     }
     dynamic data = {};
@@ -67,6 +76,11 @@ class Api {
       await store.delete(key: 'token');
       onSessionExpired?.call();
       throw ApiError('Your session expired. Please sign in again.', status: 401);
+    }
+    if (r.statusCode == 403 && map.isEmpty) {
+      // Not a CSave JSON answer: usually the request was blocked before it reached the app server.
+      debugPrint('API blocked $method $path: HTTP 403, body ${r.body.length > 80 ? r.body.substring(0, 80) : r.body}');
+      throw ApiError('We cannot reach CSave right now. Please try again in a few minutes.', status: 403);
     }
     if (r.statusCode >= 400) {
       throw ApiError((map['error'] ?? 'Something went wrong. Try again.').toString(), status: r.statusCode, needsConsent: map['needsConsent'] == true);
@@ -137,7 +151,7 @@ class Telemetry {
     if (_key.isEmpty) return;
     try {
       await http.post(Uri.parse('${Api.base}/api/telemetry/crash'), headers: await _headers(),
-          body: jsonEncode({'platform': Platform.operatingSystem, 'appVersion': '1.0.0', 'screen': screen, 'message': e.toString(), 'stack': st?.toString() ?? ''}))
+          body: jsonEncode({'platform': Platform.operatingSystem, 'appVersion': Api.appVersion, 'screen': screen, 'message': e.toString(), 'stack': st?.toString() ?? ''}))
           .timeout(const Duration(seconds: 10));
     } catch (_) {}
   }
