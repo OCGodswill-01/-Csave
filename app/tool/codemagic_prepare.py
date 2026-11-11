@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Runs on Codemagic before the build. The zip has no android/ folder, so this creates it,
 then applies the Android setup from android_notes/README_ANDROID.txt. It FAILS LOUDLY if any
-step does not apply, so you never get a silently broken APK. Pinned for Flutter 3.24.5 (Groovy gradle)."""
+step does not apply, so you never get a silently broken APK. Works with current Flutter stable (Kotlin gradle) and older Groovy templates."""
 import os, re, subprocess, sys, glob
 
 def die(msg): print('PREPARE FAILED:', msg); sys.exit(1)
@@ -44,24 +44,49 @@ k, n = re.subn(r':\s*FlutterActivity\(\)', ': FlutterFragmentActivity()', k)
 if n != 1: die('MainActivity patch did not apply')
 write(acts[0], k)
 
-# 5. app/build.gradle: minSdk 23, desugaring for notifications
-gp = 'android/app/build.gradle'
-if not os.path.exists(gp): die('android/app/build.gradle missing: Flutter version changed template (Kotlin DSL). Keep flutter: 3.24.5 in codemagic.yaml.')
-g = read(gp)
-g, n = re.subn(r'minSdk(?:Version)?\s*=?\s*flutter\.minSdkVersion', 'minSdk = 23', g)
-if n != 1: die('minSdk patch did not apply')
-g, n = re.subn(r'(compileOptions\s*\{)', r'\1\n        coreLibraryDesugaringEnabled true', g, count=1)
-if n != 1: die('compileOptions patch did not apply')
-dep = "    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'\n"
-if re.search(r'^dependencies\s*\{', g, re.M): g = re.sub(r'^(dependencies\s*\{)', r'\1\n' + dep.rstrip('\n'), g, count=1, flags=re.M)
-else: g += '\ndependencies {\n' + dep + '}\n'
-write(gp, g)
-
-# 6. release signing: Codemagic's android_signing injects these variables; the keystore never lives in git
+# 5. app Gradle file: minSdk 23, compile/target API 36 (Play requirement), desugaring for notifications, release signing.
+#    New Flutter versions generate build.gradle.kts (Kotlin); older ones generate build.gradle (Groovy). Both are handled.
 for v in ['CM_KEYSTORE_PATH', 'CM_KEYSTORE_PASSWORD', 'CM_KEY_ALIAS', 'CM_KEY_PASSWORD']:
     if not os.environ.get(v): die(f'{v} missing: add csave_upload_keystore under android_signing in codemagic.yaml')
+
+def sub1(pattern, repl, text, what, flags=0):
+    out, n = re.subn(pattern, repl, text, count=1, flags=flags)
+    if n != 1: die(f'{what} patch did not apply')
+    return out
+
+kts = os.path.exists('android/app/build.gradle.kts')
+gp = 'android/app/build.gradle.kts' if kts else 'android/app/build.gradle'
+if not os.path.exists(gp): die('no android/app/build.gradle(.kts) found after flutter create')
 g = read(gp)
-signing = """    signingConfigs {
+
+if kts:
+    g = sub1(r'minSdk(?:Version)?\s*=\s*[^\n]+', 'minSdk = 23', g, 'minSdk')
+    g = sub1(r'targetSdk(?:Version)?\s*=\s*[^\n]+', 'targetSdk = 36', g, 'targetSdk')
+    g = sub1(r'compileSdk(?:Version)?\s*=\s*[^\n]+', 'compileSdk = 36', g, 'compileSdk')
+    g = sub1(r'(compileOptions\s*\{)', r'\1\n        isCoreLibraryDesugaringEnabled = true', g, 'desugaring flag')
+    dep = '    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")\n'
+    if re.search(r'^dependencies\s*\{', g, re.M): g = re.sub(r'^(dependencies\s*\{)', r'\1\n' + dep.rstrip('\n'), g, count=1, flags=re.M)
+    else: g += '\ndependencies {\n' + dep + '}\n'
+    signing = '''    signingConfigs {
+        create("release") {
+            storeFile = file(System.getenv("CM_KEYSTORE_PATH"))
+            storePassword = System.getenv("CM_KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("CM_KEY_ALIAS")
+            keyPassword = System.getenv("CM_KEY_PASSWORD")
+        }
+    }
+'''
+    g = sub1(r'^([ \t]*)buildTypes\s*\{', lambda mo: signing + mo.group(1) + 'buildTypes {', g, 'buildTypes block', re.M)
+    g = sub1(r'signingConfig\s*=\s*signingConfigs\.getByName\("debug"\)', 'signingConfig = signingConfigs.getByName("release")', g, 'release signingConfig')
+else:
+    g = sub1(r'minSdk(?:Version)?\s*=?\s*[^\n]+', 'minSdk = 23', g, 'minSdk')
+    g = sub1(r'targetSdk(?:Version)?\s*=?\s*[^\n]+', 'targetSdk = 36', g, 'targetSdk')
+    g = sub1(r'compileSdk(?:Version)?\s*=?\s*[^\n]+', 'compileSdk = 36', g, 'compileSdk')
+    g = sub1(r'(compileOptions\s*\{)', r'\1\n        coreLibraryDesugaringEnabled true', g, 'desugaring flag')
+    dep = "    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'\n"
+    if re.search(r'^dependencies\s*\{', g, re.M): g = re.sub(r'^(dependencies\s*\{)', r'\1\n' + dep.rstrip('\n'), g, count=1, flags=re.M)
+    else: g += '\ndependencies {\n' + dep + '}\n'
+    signing = '''    signingConfigs {
         release {
             storeFile file(System.getenv("CM_KEYSTORE_PATH"))
             storePassword System.getenv("CM_KEYSTORE_PASSWORD")
@@ -69,10 +94,8 @@ signing = """    signingConfigs {
             keyPassword System.getenv("CM_KEY_PASSWORD")
         }
     }
-"""
-g, n = re.subn(r'^([ \t]*)buildTypes\s*\{', lambda mo: signing + mo.group(1) + 'buildTypes {', g, count=1, flags=re.M)
-if n != 1: die('buildTypes block not found for signing')
-g, n = re.subn(r'signingConfig\s*=?\s*signingConfigs\.debug', 'signingConfig signingConfigs.release', g)
-if n != 1: die('release signingConfig patch did not apply')
+'''
+    g = sub1(r'^([ \t]*)buildTypes\s*\{', lambda mo: signing + mo.group(1) + 'buildTypes {', g, 'buildTypes block', re.M)
+    g = sub1(r'signingConfig\s*=?\s*signingConfigs\.debug', 'signingConfig signingConfigs.release', g, 'release signingConfig')
 write(gp, g)
-print('PREPARE OK: android project ready for', api)
+print('PREPARE OK: android project ready for', api, '| gradle file:', gp)
