@@ -35,7 +35,7 @@ class _LoginState extends State<LoginScreen> {
       if (!ok && !await _otp(email.text.trim())) { if (mounted) setState(() => busy = false); return; }
       if (!mounted) return;
       Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const Shell()));
-    } catch (e) { setState(() => err = friendly(e)); }
+    } catch (e) { if (mounted) setState(() => err = friendly(e)); }
     if (mounted) setState(() => busy = false);
   }
 
@@ -488,7 +488,7 @@ class _WithdrawState extends State<WithdrawSheet> {
     if (code == null) { setState(() => msg = 'Choose the bank that holds the account.'); return; }
     if (!RegExp(r'^\d{4}$').hasMatch(pin.text)) { setState(() => msg = 'Enter your 4-digit PIN.'); return; }
     // Fingerprint (if on) opens the gate; the server still verifies the 4-digit PIN.
-    if (await Bio.enabled && !await Bio.prompt('Confirm withdrawal')) { setState(() => msg = 'Fingerprint not confirmed.'); return; }
+    if (await Bio.enabled && !await Bio.prompt('Confirm withdrawal')) { if (mounted) setState(() => msg = 'Fingerprint not confirmed.'); return; }
     setState(() { busy = true; msg = null; });
     final messenger = ScaffoldMessenger.of(context);
     try {
@@ -574,7 +574,7 @@ class _ProfileState extends State<ProfilePage> {
       } catch (e) { _snack(friendly(e)); return; }
       await store.write(key: 'bioPass', value: pw);   // kept in Keystore/Keychain, released only after fingerprint
     } else { await store.delete(key: 'bioPass'); }
-    await Bio.setEnabled(v); setState(() => bio = v);
+    await Bio.setEnabled(v); if (mounted) setState(() => bio = v);
   }
 
   Future<String?> _askPassword() {
@@ -595,7 +595,7 @@ class _ProfileState extends State<ProfilePage> {
     try { await Api.call('POST', '/api/me/pin', {'pin': p}); _snack('PIN saved.'); } catch (e) { _snack(friendly(e)); }
   }
 
-  void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+  void _snack(String m) { if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m))); }
 
   @override
   Widget build(BuildContext context) => FutureBuilder(
@@ -785,7 +785,7 @@ class _ForgotState extends State<ForgotScreen> {
         await store.delete(key: 'bioPass'); await Bio.setEnabled(false);   // the old password is dead: switch the fingerprint sign-in off
         if (mounted) { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Password changed. Sign in with your new password.'))); Navigator.pop(context); }
       }
-    } catch (e) { setState(() => err = friendly(e)); }
+    } catch (e) { if (mounted) setState(() => err = friendly(e)); }
     if (mounted) setState(() => busy = false);
   }
 
@@ -801,7 +801,7 @@ class _ForgotState extends State<ForgotScreen> {
             TextField(controller: code, keyboardType: TextInputType.number, maxLength: 6, decoration: const InputDecoration(labelText: '6-digit code')),
             TextField(controller: pass, obscureText: true, decoration: const InputDecoration(labelText: 'New password (8+ characters)')),
           ],
-          if (err != null) Padding(padding: const EdgeInsets.only(top: 10), child: Text(err!, style: const TextStyle(color: Colors.redAccent))),
+          if (err != null) Padding(padding: const EdgeInsets.only(top: 10), child: Text(err ?? '', style: const TextStyle(color: Colors.redAccent))),
           const SizedBox(height: 16),
           FilledButton(style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(52)), onPressed: busy ? null : go, child: Text(sent ? 'Change password' : 'Send code')),
         ]),
