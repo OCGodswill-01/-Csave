@@ -90,7 +90,7 @@ class Api {
 
   /// Returns true when signed in, false when a staff email code is still needed.
   static Future<bool> login(String email, String pass) async {
-    final d = await call('POST', '/api/auth/login', {'email': email, 'password': pass});
+    final d = await call('POST', '/api/auth/login', {'email': email, 'password': pass, 'deviceId': await Telemetry._device()});
     await store.write(key: 'email', value: email);
     if (d['otpRequired'] == true) return false;
     await store.write(key: 'token', value: d['token']);
@@ -109,6 +109,15 @@ class Api {
     await store.delete(key: 'bioPass');
     await store.write(key: 'bio', value: '0');
     try { await Notify.cancelAll(); } catch (_) {}
+  }
+
+  /// Full sign-out, as if the app had just been installed: also clears the saved email,
+  /// device ID and reminder setting. The theme is kept.
+  static Future<void> clearAccount() async {
+    await forgetDevice();
+    await store.delete(key: 'email');
+    await store.delete(key: 'device');
+    await store.delete(key: 'alarms');
   }
 
   static Future<Map> wallet() async => Map<String, dynamic>.from(await call('GET', '/api/wallet'));
