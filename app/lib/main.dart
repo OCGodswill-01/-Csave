@@ -4,10 +4,12 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'api.dart';
 import 'screens.dart';
 import 'notify.dart';
+import 'splash.dart';
 
 const orange = Color(0xFFD4730A), deep = Color(0xFF9A4A0C), ink = Color(0xFF0B0B0B), panel = Color(0xFF1A1A1A);
 
 final themeMode = ValueNotifier<ThemeMode>(ThemeMode.dark);
+final appNavigator = GlobalKey<NavigatorState>();
 
 void main() {
   runZonedGuarded(() async {
@@ -46,7 +48,9 @@ class CSaveApp extends StatelessWidget {
           theme: _theme(Brightness.light),
           darkTheme: _theme(Brightness.dark),
           themeMode: mode,
-          home: const AppLock(child: Entry()),
+          navigatorKey: appNavigator,
+          builder: (context, child) => AppLock(child: child!),
+          home: const Splash(next: Entry()),
         ),
       );
 }
@@ -59,8 +63,8 @@ Future<void> toggleTheme() async {
 /// Locks the screen when the app goes to the background (so the balance is hidden in the app switcher).
 /// On return:
 ///  - fingerprint on: the member unlocks with the fingerprint. If it fails they can try again or use the password.
-///  - fingerprint off: a short trip (under 2 minutes, for example copying an account number from a bank app) unlocks
-///    by itself. A longer absence asks for the password. The member stays signed in, so a cancelled prompt never logs them out.
+///  - fingerprint off: the normal password is asked for.
+///  Every return locks the app immediately. The member stays signed in, so a cancelled prompt never logs them out.
 class AppLock extends StatefulWidget {
   final Widget child;
   const AppLock({super.key, required this.child});
@@ -69,11 +73,11 @@ class AppLock extends StatefulWidget {
 }
 
 class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
-  static const grace = Duration(minutes: 2);
   bool locked = false, usePassword = false, busy = false, hasBio = false;
   DateTime? pausedAt;
   String? err;
   final pw = TextEditingController();
+  String memberName = '';
 
   @override
   void initState() {
@@ -83,7 +87,7 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
       if (!mounted) return;
       ScaffoldMessenger.maybeOf(context)?.showSnackBar(const SnackBar(content: Text('Your session expired. Please sign in again.')));
       setState(() => locked = false);
-      Navigator.of(context).pushAndRemoveUntil(MaterialPageRoute(builder: (_) => const Entry()), (_) => false);
+      appNavigator.currentState?.pushAndRemoveUntil(MaterialPageRoute(builder: (_) => const Entry()), (_) => false);
     };
   }
 
@@ -94,14 +98,20 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState s) async {
     // Only lock on paused (background). inactive fires for the notification shade.
     if (s == AppLifecycleState.paused) {
-      if (await store.read(key: 'token') != null) { pausedAt ??= DateTime.now(); if (mounted) setState(() { locked = true; usePassword = false; err = null; }); }
+      if (await store.read(key: 'token') != null) { pausedAt ??= DateTime.now(); if (mounted) setState(() { locked = true; usePassword = false; err = null; }); _loadName(); }
     }
     if (s == AppLifecycleState.resumed && locked) {
       hasBio = await Bio.enabled;
-      final away = pausedAt == null ? Duration.zero : DateTime.now().difference(pausedAt!);
-      if (!hasBio && away < grace) { _open(); return; }
       unlock();
     }
+  }
+
+  Future<void> _loadName() async {
+    try {
+      final me = await Api.call('GET', '/api/me');
+      final n = (me['name'] ?? '').toString();
+      if (mounted && n.isNotEmpty) setState(() => memberName = n);
+    } catch (_) {}
   }
 
   void _open() { if (mounted) setState(() { locked = false; usePassword = false; pausedAt = null; err = null; busy = false; pw.clear(); }); }
@@ -132,9 +142,9 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
   }
 
   Future<void> _signOut() async {
-    await Api.forgetDevice();
+    await Api.clearAccount();
     _open();
-    if (mounted) Navigator.of(context).pushAndRemoveUntil(MaterialPageRoute(builder: (_) => const Entry()), (_) => false);
+    appNavigator.currentState?.pushAndRemoveUntil(MaterialPageRoute(builder: (_) => const Splash(next: Entry())), (_) => false);
   }
 
   @override
@@ -147,19 +157,22 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
               padding: const EdgeInsets.all(24),
               child: Center(child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
                 const Text('CSave', style: TextStyle(fontSize: 40, fontWeight: FontWeight.bold)),
-                const SizedBox(height: 16),
+                if (memberName.isNotEmpty) ...[const SizedBox(height: 6), Text(memberName, style: const TextStyle(fontSize: 18))],
+                const SizedBox(height: 24),
                 if (usePassword) ...[
                   const Text('Enter your password to continue', textAlign: TextAlign.center),
                   const SizedBox(height: 12),
                   TextField(controller: pw, obscureText: true, onSubmitted: (_) => unlockWithPassword(), decoration: const InputDecoration(labelText: 'Password')),
                   const SizedBox(height: 12),
                   FilledButton(onPressed: busy ? null : unlockWithPassword, child: Text(busy ? 'Checking...' : 'Unlock')),
-                ] else
-                  FilledButton(onPressed: unlock, child: const Text('Unlock')),
-                if (hasBio && usePassword == false && err != null)
-                  TextButton(onPressed: () => setState(() { usePassword = true; err = null; }), child: const Text('Use password instead')),
+                  if (hasBio) TextButton(onPressed: () => setState(() { usePassword = false; err = null; }), child: const Text('Verify via fingerprint')),
+                ] else if (hasBio)
+                  FilledButton(onPressed: busy ? null : unlock, child: const Text('Verify via fingerprint')),
                 if (err != null) Padding(padding: const EdgeInsets.only(top: 10), child: Text(err!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.redAccent))),
-                TextButton(onPressed: _signOut, child: const Text('Sign out')),
+                const SizedBox(height: 24),
+                if (!usePassword) OutlinedButton(onPressed: () => setState(() { usePassword = true; err = null; }), child: const Text('Login with password')),
+                const SizedBox(height: 8),
+                TextButton(onPressed: _signOut, child: const Text('Logout')),
               ]))),
             ),
           ),
