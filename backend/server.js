@@ -83,6 +83,7 @@ const User = mongoose.model('User', new mongoose.Schema({
   resetCodeHash: String, resetExpires: Date, resetFails: { type: Number, default: 0 },
   active: { type: Boolean, default: true }, lastLoginAt: Date, referredBy: { type: mongoose.Schema.Types.ObjectId, index: true },
   otpHash: String, otpExpires: Date, otpFails: { type: Number, default: 0 },
+  pendingDevice: String, trustedDevices: { type: [String], default: [] },
   pinFails: { type: Number, default: 0 }, pinLockedUntil: Date,
   tokenVersion: { type: Number, default: 0 },     // bumped on password change so old JWTs die
   loginFails: { type: Number, default: 0 }, loginLockedUntil: Date,
@@ -229,10 +230,13 @@ app.post('/api/auth/login', loginIpLimit, loginLimit, async (req, res) => {
   }
   if (u.fraudFlag) return res.status(403).json({ error: 'This account is locked for review. Contact support.' });
   u.loginFails = 0; u.loginLockedUntil = undefined;
-  if (u.role !== 'customer') {                     // staff always confirm with an emailed code
+  const deviceId = String(req.body.deviceId || '');
+  const knownDevice = !!deviceId && (u.trustedDevices || []).includes(deviceId);
+  if (u.role !== 'customer' || !knownDevice) {                     // staff always confirm with an emailed code
     const code = String(crypto.randomInt(100000, 1000000));
-    u.otpHash = await bcrypt.hash(code, 10); u.otpExpires = new Date(Date.now() + 10 * 60000); u.otpFails = 0; await u.save();
-    sendEmail(u.email, 'Your CSave staff sign-in code', mail('Your verification code',
+    u.otpHash = await bcrypt.hash(code, 10); u.otpExpires = new Date(Date.now() + 10 * 60000); u.otpFails = 0;
+    u.pendingDevice = u.role === 'customer' ? (deviceId || undefined) : undefined; await u.save();
+    sendEmail(u.email, u.role === 'customer' ? 'Your CSave sign-in code' : 'Your CSave staff sign-in code', mail('Your verification code',
       `<p>Hi <b>${hescape(u.name)}</b>, use this code to sign in to CSave. It expires in <b style="color:#d4730a">10 minutes</b> and can only be used once.</p>
        <p style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#d4730a;text-align:center">${code}</p>
        <p style="color:#8a8580">If you did not try to sign in, change your password immediately.</p>`));
@@ -247,7 +251,9 @@ app.post('/api/auth/verify-otp', otpLimit, async (req, res) => {
   const bad = () => res.status(401).json({ error: 'That code is wrong or has expired.' });
   if (!u || u.active === false || !u.otpHash || u.otpExpires < new Date() || u.otpFails >= 5) return bad();
   if (!(await bcrypt.compare(String(req.body.code || ''), u.otpHash))) { u.otpFails += 1; await u.save(); return bad(); }
-  u.otpHash = undefined; u.otpExpires = undefined; u.lastLoginAt = new Date(); await u.save();
+  u.otpHash = undefined; u.otpExpires = undefined; u.lastLoginAt = new Date();
+  if (u.pendingDevice) { u.trustedDevices = [...(u.trustedDevices || []).filter(d => d !== u.pendingDevice), u.pendingDevice].slice(-10); u.pendingDevice = undefined; }
+  await u.save();
   Audit.create({ actor: u._id, role: u.role, action: 'STAFF_LOGIN', ip: req.ip }).catch(() => {});
   res.json({ token: sign(u), user: { name: u.name, email: u.email, role: u.role } });
 });
