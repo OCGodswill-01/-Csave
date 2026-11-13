@@ -75,7 +75,9 @@ const User = mongoose.model('User', new mongoose.Schema({
   pinHash: String,                                // 4-digit withdrawal PIN (hashed)
   role: { type: String, enum: ['customer','admin','finance','operations','support','tech'], default: 'customer' },
   kycStatus: { type: String, enum: ['none','pending','approved','rejected'], default: 'none' },
-  kyc: { phone: String, address: String, dob: String, idType: String, idLast4: String, idNumberEnc: String, idHash: { type: String, index: true }, nextOfKin: String, submittedAt: Date, bvnCheck: String, bvnCheckedAt: Date },
+  kyc: { phone: String, address: String, dob: String, idType: String, idLast4: String, idNumberEnc: String, idHash: { type: String, index: true }, nextOfKin: String, submittedAt: Date, bvnCheck: String, bvnCheckedAt: Date,
+    gender: String, maritalStatus: String, occupation: String, placeOfOrigin: String, proofOfAddress: String },
+  kycRejectReason: String, kycRejectedAt: Date,
   kycApprovals: [{ _id: false, by: mongoose.Schema.Types.ObjectId, at: Date }],   // two different staff must approve (KYC_APPROVALS_REQUIRED)
   aiConsentAt: Date,                               // member agreed to AI features that send their data to the AI provider
   membershipPaid: { type: Boolean, default: false }, membershipPaidAt: Date, membershipFlwId: String, membershipId: { type: String, index: true }, membershipEmailSent: Boolean,
@@ -151,16 +153,20 @@ app.use((req, res, next) => {
 
 // ---------- AUTH HELPERS ----------
 const sign = u => jwt.sign({ id: u._id, role: u.role, tv: u.tokenVersion || 0 }, process.env.JWT_SECRET, { expiresIn: '12h' });
+// Before KYC is approved AND the membership fee is paid, a member may only use these routes.
+const KYC_GATE_OPEN = ['/api/me', '/api/kyc', '/api/membership/pay'];
 const auth = async (req, res, next) => {
   try {
     const payload = jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), process.env.JWT_SECRET);
     req.user = payload;
-    const u = await User.findById(payload.id).select('active role tokenVersion fraudFlag');
+    const u = await User.findById(payload.id).select('active role tokenVersion fraudFlag kycStatus membershipPaid');
     if (!u || u.active === false) return res.status(401).json({ error: 'Please log in again.', code: 'session_expired' });
     if ((u.tokenVersion || 0) !== (payload.tv || 0)) return res.status(401).json({ error: 'Please log in again.', code: 'session_expired' });
     if (u.fraudFlag) return res.status(403).json({ error: 'This account is locked for review. Contact support.' });
     if (!geoOk(req)) return res.status(403).json({ error: 'Access from your location is not allowed.' });
     if (u.role !== 'customer' && u.role !== payload.role) return res.status(401).json({ error: 'Please log in again.', code: 'session_expired' });
+    if (u.role === 'customer' && !(u.kycStatus === 'approved' && u.membershipPaid) && !KYC_GATE_OPEN.includes(req.path))
+      return res.status(403).json({ error: 'Complete your KYC and pay the ₦5,000 membership to use CSave.', code: 'KYC_REQUIRED' });
     req.user.role = u.role;
     next();
   } catch { res.status(401).json({ error: 'Please log in again.', code: 'session_expired' }); }
@@ -263,7 +269,7 @@ app.get('/api/me', auth, async (req, res) => {
   // Referral code is given only after KYC is approved AND the membership fee is paid
   if (u.kycStatus === 'approved' && u.membershipPaid && !u.referralCode) { u.referralCode = await makeReferral(u); await u.save(); }
   const eligible = u.kycStatus === 'approved' && u.membershipPaid;
-  res.json({ name: u.name, email: u.email, role: u.role, kycStatus: u.kycStatus, hasPin: !!u.pinHash,
+  res.json({ name: u.name, email: u.email, role: u.role, kycStatus: u.kycStatus, kycRejectReason: u.kycStatus === 'rejected' ? (u.kycRejectReason || null) : null, hasPin: !!u.pinHash,
     membershipPaid: u.membershipPaid, membershipId: u.membershipId, referralCode: eligible ? u.referralCode : null, referralReward: eligible ? await currentReferralRewardText() : null, aiConsent: !!u.aiConsentAt });
 });
 
@@ -753,8 +759,11 @@ const ID_TYPES = ['NIN', 'BVN', 'Voter card', "Driver's licence", 'International
 const KYC_NEEDED = () => Math.max(1, Number(process.env.KYC_APPROVALS_REQUIRED) || 2);
 
 app.post('/api/kyc', auth, async (req, res) => {
-  const { phone, address, dob, idType, idNumber, nextOfKin } = req.body;
-  if (![phone, address, dob, idType, idNumber, nextOfKin].every(x => x && String(x).trim())) return res.status(400).json({ error: 'Fill in every field.' });
+  const { phone, dob, idType, idNumber, nextOfKin, gender, maritalStatus, occupation, placeOfOrigin, proofOfAddress } = req.body;
+  const address = String(req.body.residentialAddress || req.body.address || '');
+  if (![phone, address, dob, idType, idNumber, nextOfKin, gender, maritalStatus, occupation, placeOfOrigin, proofOfAddress].every(x => x && String(x).trim())) return res.status(400).json({ error: 'Fill in every field.' });
+  if (!['Male', 'Female'].includes(gender)) return res.status(400).json({ error: 'Pick male or female.' });
+  if (!['Single', 'Married', 'Divorced', 'Widowed'].includes(maritalStatus)) return res.status(400).json({ error: 'Pick your marital status.' });
   if (!ID_TYPES.includes(idType)) return res.status(400).json({ error: 'Pick an ID type from the list.' });
   const idNo = String(idNumber).replace(/\s+/g, '');
   if ((idType === 'NIN' || idType === 'BVN') && !/^\d{11}$/.test(idNo)) return res.status(400).json({ error: `A ${idType} has exactly 11 digits.` });
@@ -781,7 +790,8 @@ app.post('/api/kyc', auth, async (req, res) => {
     bvnCheck = v.result;                                    // 'match', 'off' (keys not set) or 'unchecked' (service did not answer)
     if (v.result === 'match') bvnCheckedAt = new Date();
   }
-  u.kyc = { phone, address, dob, idType, idLast4: idNo.slice(-4), idNumberEnc: aesEnc(kycKey(), idNo), idHash, nextOfKin, submittedAt: new Date(), bvnCheck, bvnCheckedAt };
+  u.kyc = { phone, address, dob, idType, idLast4: idNo.slice(-4), idNumberEnc: aesEnc(kycKey(), idNo), idHash, nextOfKin, submittedAt: new Date(), bvnCheck, bvnCheckedAt,
+    gender, maritalStatus, occupation: String(occupation).trim(), placeOfOrigin: String(placeOfOrigin).trim(), proofOfAddress: String(proofOfAddress).trim() };
   u.kycApprovals = []; u.kycStatus = 'pending'; await u.save();           // a new submission starts the approvals again
   log(req, 'KYC_SUBMITTED'); res.json({ ok: true });
 });
@@ -843,23 +853,31 @@ app.get('/api/admin/kyc/:id', auth, requireRole('admin', 'operations'), async (r
   if (!u) return res.status(404).json({ error: 'Member not found.' });
   let idNumber = null; try { if (u.kyc?.idNumberEnc && kycKey()) idNumber = aesDec(kycKey(), u.kyc.idNumberEnc); } catch {}
   log(req, 'KYC_VIEWED', { member: u._id });
-  res.json({ name: u.name, status: u.kycStatus, phone: u.kyc?.phone, address: u.kyc?.address, dob: u.kyc?.dob, idType: u.kyc?.idType, idNumber, idLast4: u.kyc?.idLast4,
+  res.json({ name: u.name, status: u.kycStatus, phone: u.kyc?.phone, address: u.kyc?.address, dob: u.kyc?.dob, gender: u.kyc?.gender, maritalStatus: u.kyc?.maritalStatus, occupation: u.kyc?.occupation, placeOfOrigin: u.kyc?.placeOfOrigin, proofOfAddress: u.kyc?.proofOfAddress, idType: u.kyc?.idType, idNumber, idLast4: u.kyc?.idLast4,
     nextOfKin: u.kyc?.nextOfKin, submittedAt: u.kyc?.submittedAt, bvnCheck: u.kyc?.bvnCheck, bvnCheckedAt: u.kyc?.bvnCheckedAt, approvals: (u.kycApprovals || []).length, approvalsNeeded: KYC_NEEDED() });
 });
 
 // Four-eyes rule: one person can reject, but approval needs KYC_APPROVALS_REQUIRED (default 2) DIFFERENT staff.
 app.post('/api/admin/kyc/:id', auth, requireRole('admin', 'operations'), async (req, res) => {
   const decision = req.body.decision;
-  if (!['approved', 'rejected'].includes(decision)) return res.status(400).json({ error: 'Decision must be approved or rejected.' });
+  if (!['approved', 'rejected', 'revoked'].includes(decision)) return res.status(400).json({ error: 'Decision must be approved, rejected or revoked.' });
+  const reason = String(req.body.reason || '').trim();
+  if ((decision === 'rejected' || decision === 'revoked') && reason.length < 5) return res.status(400).json({ error: 'Write the reason (at least 5 characters). The member will see it.' });
   const id = okId(req.params.id) ? req.params.id : null;
   const u = await User.findOne({ _id: id, role: 'customer' });
   if (!u) return res.status(404).json({ error: 'Member not found.' });
+  if (decision === 'revoked') {
+    if (u.kycStatus !== 'approved') return res.status(409).json({ error: 'Only an approved KYC can be revoked.' });
+    await User.updateOne({ _id: id }, { kycStatus: 'rejected', kycApprovals: [], kycRejectReason: reason, kycRejectedAt: new Date() });
+    await Notif.create({ user: u._id, title: 'Your KYC was revoked', body: `Your KYC was revoked. Reason: ${reason}. Please correct it and submit again.` });
+    log(req, 'KYC_REVOKED', { member: u._id, reason }); return res.json({ ok: true, status: 'rejected' });
+  }
   if (u.kycStatus !== 'pending') return res.status(409).json({ error: 'This KYC is not waiting for review.' });
   if (decision === 'rejected') {
-    const r = await User.findOneAndUpdate({ _id: id, kycStatus: 'pending' }, { kycStatus: 'rejected', kycApprovals: [] });
+    const r = await User.findOneAndUpdate({ _id: id, kycStatus: 'pending' }, { kycStatus: 'rejected', kycApprovals: [], kycRejectReason: reason, kycRejectedAt: new Date() });
     if (!r) return res.status(409).json({ error: 'This KYC was already reviewed.' });
-    await Notif.create({ user: u._id, title: 'KYC needs attention', body: 'We could not approve your KYC. Please check your details and submit again.' });
-    log(req, 'KYC_REJECTED', { member: u._id }); return res.json({ ok: true, status: 'rejected' });
+    await Notif.create({ user: u._id, title: 'KYC needs attention', body: `We could not approve your KYC. Reason: ${reason}. Please check your details and submit again.` });
+    log(req, 'KYC_REJECTED', { member: u._id, reason }); return res.json({ ok: true, status: 'rejected' });
   }
   const after = await User.findOneAndUpdate({ _id: id, kycStatus: 'pending', 'kycApprovals.by': { $ne: req.user.id } }, { $push: { kycApprovals: { by: req.user.id, at: new Date() } } }, { new: true });
   if (!after) return res.status(409).json({ error: 'You already gave your approval. A different staff member must give the next one.' });
@@ -1920,6 +1938,34 @@ try {
 
 // ---------- BANK LIST (the app's withdraw bank picker; read from Flutterwave, cached for a day) ----------
 let bankList = { at: 0, banks: [] };
+// ---------- LIVE RATES: USD, GBP, EUR, CNY per 1 unit, in NGN ----------
+// Cached for 10 minutes. If Flutterwave gives no usable rate, the route returns rates: null and the app says
+// "live rate unavailable" instead of showing a made-up number.
+// VERIFY FLW_RATE_URL and the response shape against Flutterwave's live docs before launch.
+const FX_CURRENCIES = ['USD', 'GBP', 'EUR', 'CNY'];
+const FLW_RATE_URL = 'https://api.flutterwave.com/v3/rates';
+let fxCache = { at: 0, rates: null };
+async function fetchFlwRate(code) {
+  const r = await fetch(`${FLW_RATE_URL}?amount=1&from=${code}&to=NGN`, { headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}` } });
+  const j = await r.json().catch(() => ({}));
+  const rate = Number(j?.data?.rate ?? j?.rate);
+  if (!r.ok || !(rate > 0)) throw new Error(`no rate for ${code}`);
+  return rate;
+}
+app.get('/api/fx', auth, async (req, res) => {
+  if (fxCache.rates && Date.now() - fxCache.at < 10 * 60 * 1000) return res.json({ rates: fxCache.rates, asOf: fxCache.at });
+  if (!process.env.FLW_SECRET_KEY) return res.json({ rates: null, reason: 'not configured' });
+  try {
+    const out = {};
+    for (const c of FX_CURRENCIES) out[c] = await fetchFlwRate(c);
+    fxCache = { at: Date.now(), rates: out };
+    res.json({ rates: out, asOf: fxCache.at });
+  } catch (e) {
+    console.error('fx', e.message);
+    res.json({ rates: null, reason: 'unavailable' });
+  }
+});
+
 app.get('/api/banks', auth, async (req, res) => {
   if (bankList.banks.length && Date.now() - bankList.at < 24 * 3600000) return res.json(bankList.banks);
   const r = await fetch('https://api.flutterwave.com/v3/banks/NG', { headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}` } }).then(x => x.json()).catch(() => null);
