@@ -120,6 +120,14 @@ class Api {
     await store.delete(key: 'alarms');
   }
 
+  /// Live rates per 1 unit in NGN for USD, GBP, EUR, CNY. Returns null when the live rate is unavailable.
+  static Future<Map<String, double>?> fx() async {
+    final d = Map<String, dynamic>.from(await call('GET', '/api/fx'));
+    final r = d['rates'];
+    if (r == null) return null;
+    return Map<String, dynamic>.from(r as Map).map((k, v) => MapEntry(k, (v as num).toDouble()));
+  }
+
   static Future<Map> wallet() async => Map<String, dynamic>.from(await call('GET', '/api/wallet'));
   /// Nigerian banks from Flutterwave, as {code, name}. The member picks one; the code is what the server needs.
   static Future<List<Map>> banks() async => List<Map>.from(await call('GET', '/api/banks'));
