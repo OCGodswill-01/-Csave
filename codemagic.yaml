@@ -1,4 +1,4 @@
-# Codemagic: builds the C'SAVE Android app. Repo root = this csave/ folder (app/ and backend/ inside).
+# Codemagic: builds the C'SAVE Android app and the web app. Repo root = this csave/ folder (app/ and backend/ inside).
 # In Codemagic: create a variable group named  csave_app  with
 #   API_BASE_URL  = https://api.abiacsave.com.ng   (must be https, no trailing slash)
 #   TELEMETRY_KEY = same value as TELEMETRY_KEY in the backend .env (optional)
@@ -54,3 +54,31 @@ workflows:
         script: flutter build apk --release --build-name=1.3.1 --build-number=11
     artifacts:
       - build/app/outputs/flutter-apk/*.apk
+
+  web-app:
+    name: CSave Web app
+    max_build_duration: 30
+    working_directory: app
+    environment:
+      flutter: stable
+      groups:
+        - csave_app
+    scripts:
+      - name: Create web project and environment file
+        script: |
+          API=$(echo "$API_BASE_URL" | sed 's:/*$::')
+          case "$API" in https://*) ;; *) echo "API_BASE_URL must start with https://"; exit 1;; esac
+          printf "API_BASE_URL=%s\nTELEMETRY_KEY=%s\n" "$API" "$TELEMETRY_KEY" > flutter_app.env
+          flutter create . --platforms=web --project-name app
+      - name: Remove sample test
+        script: rm -rf test
+      - name: Get packages
+        script: flutter pub get
+      - name: Check code (real errors fail the build)
+        script: flutter analyze --no-fatal-infos --no-fatal-warnings lib
+      - name: Build web
+        script: flutter build web --release
+      - name: Pack the web build into one zip
+        script: cd build/web && zip -r ../web.zip .
+    artifacts:
+      - build/web.zip
