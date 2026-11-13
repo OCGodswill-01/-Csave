@@ -306,9 +306,7 @@ class _Action extends StatelessWidget {
       ]));
 }
 
-// ---------------- CONVERTER (¥ CNY added) ----------------
-// Placeholder rates (per 1 unit, in NGN). Replace with a live rates API before launch.
-const rates = {'NGN': 1.0, 'USD': 1500.0, 'GBP': 1900.0, 'EUR': 1650.0, 'CNY': 210.0};
+// ---------------- CONVERTER (live rates from the server) ----------------
 const symbols = {'NGN': '₦', 'USD': '\$', 'GBP': '£', 'EUR': '€', 'CNY': '¥'};
 
 class Converter extends StatefulWidget {
@@ -319,12 +317,37 @@ class Converter extends StatefulWidget {
 
 class _ConverterState extends State<Converter> {
   String from = 'NGN', to = 'CNY'; final amt = TextEditingController(text: '10000');
+  Map<String, double>? rates; // per 1 unit in NGN; null means the live rate is unavailable
+  bool loading = true;
+
+  @override
+  void initState() { super.initState(); _load(); }
+
+  Future<void> _load() async {
+    try {
+      final r = await Api.fx();
+      if (mounted) setState(() { rates = r == null ? null : {'NGN': 1.0, ...r}; loading = false; });
+    } catch (_) {
+      if (mounted) setState(() { rates = null; loading = false; });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (loading) return const Card(child: Padding(padding: EdgeInsets.all(16), child: Center(child: CircularProgressIndicator())));
+    final rt = rates;
+    if (rt == null) {
+      return Card(child: Padding(padding: const EdgeInsets.all(16), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Currency converter', style: TextStyle(fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        const Text('Live rate unavailable right now. Please try again later.'),
+        TextButton(onPressed: () { setState(() => loading = true); _load(); }, child: const Text('Try again')),
+      ])));
+    }
     final v = double.tryParse(amt.text) ?? 0;
-    final out = v * rates[from]! / rates[to]!;
+    final out = v * rt[from]! / rt[to]!;
     DropdownButton<String> dd(String val, ValueChanged<String?> f) =>
-        DropdownButton(value: val, items: rates.keys.map((k) => DropdownMenuItem(value: k, child: Text(k))).toList(), onChanged: f);
+        DropdownButton(value: val, items: rt.keys.map((k) => DropdownMenuItem(value: k, child: Text(k))).toList(), onChanged: f);
     return Card(child: Padding(padding: const EdgeInsets.all(16), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       const Text('Currency converter', style: TextStyle(fontWeight: FontWeight.bold)),
       TextField(controller: amt, keyboardType: TextInputType.number, onChanged: (_) => setState(() {})),
@@ -611,7 +634,7 @@ class _ProfileState extends State<ProfilePage> {
             Card(child: ListTile(
               leading: Icon(kyc ? Icons.verified : Icons.flag, color: kyc ? Colors.green : Colors.redAccent),
               title: Text(kyc ? 'KYC verified' : d['kycStatus'] == 'pending' ? 'KYC under review' : d['kycStatus'] == 'rejected' ? 'KYC needs attention' : 'KYC not complete'),
-              subtitle: Text(kyc ? 'You can withdraw.' : d['kycStatus'] == 'pending' ? 'We will notify you when it is approved.' : 'Complete KYC to withdraw and unlock referrals.'),
+              subtitle: Text(kyc ? 'You can withdraw.' : d['kycStatus'] == 'pending' ? 'We will notify you when it is approved.' : d['kycStatus'] == 'rejected' && d['kycRejectReason'] != null ? 'Reason: ${d['kycRejectReason']}. Tap to correct and submit again.' : 'Complete KYC to withdraw and unlock referrals.'),
               onTap: kyc || d['kycStatus'] == 'pending' ? null : () => Navigator.push(context, MaterialPageRoute(builder: (_) => const KycScreen())).then((_) => setState(() => f = Api.call('GET', '/api/me'))))),
             Card(child: ListTile(
               leading: Icon(d['membershipPaid'] ? Icons.card_membership : Icons.flag, color: d['membershipPaid'] ? Colors.green : Colors.redAccent),
@@ -639,13 +662,14 @@ class KycScreen extends StatefulWidget {
 }
 
 class _KycState extends State<KycScreen> {
-  final f = {for (var k in ['phone', 'address', 'dob', 'idNumber', 'nextOfKin']) k: TextEditingController()};
+  final f = {for (var k in ['phone', 'residentialAddress', 'placeOfOrigin', 'occupation', 'dob', 'idNumber', 'nextOfKin']) k: TextEditingController()};
   String idType = 'NIN'; String? err; bool busy = false;
+  String? gender, marital, proof;
 
   Future<void> submit() async {
     setState(() { busy = true; err = null; });
     try {
-      await Api.call('POST', '/api/kyc', {for (var e in f.entries) e.key: e.value.text.trim(), 'idType': idType});
+      await Api.call('POST', '/api/kyc', {for (var e in f.entries) e.key: e.value.text.trim(), 'idType': idType, 'gender': gender, 'maritalStatus': marital, 'proofOfAddress': proof});
       if (mounted) { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('KYC submitted. We will review it.'))); Navigator.pop(context); }
     } catch (e) { setState(() => err = friendly(e)); }
     if (mounted) setState(() => busy = false);
@@ -660,7 +684,18 @@ class _KycState extends State<KycScreen> {
         body: ListView(padding: const EdgeInsets.all(20), children: [
           _t('phone', 'Phone number', TextInputType.phone),
           _t('dob', 'Date of birth (DD/MM/YYYY)'),
-          _t('address', 'Home address'),
+          DropdownButtonFormField<String>(value: gender, decoration: const InputDecoration(labelText: 'Gender'),
+              items: ['Male', 'Female'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(), onChanged: (v) => setState(() => gender = v)),
+          const SizedBox(height: 10),
+          DropdownButtonFormField<String>(value: marital, decoration: const InputDecoration(labelText: 'Marital status'),
+              items: ['Single', 'Married', 'Divorced', 'Widowed'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(), onChanged: (v) => setState(() => marital = v)),
+          const SizedBox(height: 10),
+          _t('occupation', 'Occupation'),
+          _t('placeOfOrigin', 'Place of origin (state and LGA)'),
+          _t('residentialAddress', 'Residential address (where you live now)'),
+          DropdownButtonFormField<String>(value: proof, decoration: const InputDecoration(labelText: 'Proof of address'),
+              items: ['NEPA bill', 'Water bill', 'Tenancy agreement', 'Bank statement', 'Other utility bill'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(), onChanged: (v) => setState(() => proof = v)),
+          const SizedBox(height: 10),
           DropdownButtonFormField<String>(value: idType, decoration: const InputDecoration(labelText: 'ID type'),
               items: ['NIN', 'BVN', 'Voter card', "Driver's licence", 'International passport'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
               onChanged: (v) => setState(() => idType = v!)),
