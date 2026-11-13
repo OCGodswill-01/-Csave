@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show HandshakeException, Platform, SocketException;
 import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
@@ -58,14 +57,10 @@ class Api {
     } on TimeoutException catch (e) {
       debugPrint('API timeout $method $path: $e');
       throw ApiError('This is taking too long. Check your network and try again.');
-    } on SocketException catch (e) {
-      debugPrint('API socket error $method $path: $e');
-      throw ApiError('No internet connection. Check your network and try again.');
-    } on HandshakeException catch (e) {
-      debugPrint('API TLS error $method $path: $e');
-      throw ApiError('Could not open a secure connection. Check your network and try again.');
     } on http.ClientException catch (e) {
       debugPrint('API client error $method $path: $e');
+      final msg = e.toString();
+      if (msg.contains('HandshakeException') || msg.contains('CERTIFICATE')) throw ApiError('Could not open a secure connection. Check your network and try again.');
       throw ApiError('No internet connection. Check your network and try again.');
     }
     dynamic data = {};
@@ -168,7 +163,7 @@ class Telemetry {
     if (_key.isEmpty) return;
     try {
       await http.post(Uri.parse('${Api.base}/api/telemetry/crash'), headers: await _headers(),
-          body: jsonEncode({'platform': Platform.operatingSystem, 'appVersion': Api.appVersion, 'screen': screen, 'message': e.toString(), 'stack': st?.toString() ?? ''}))
+          body: jsonEncode({'platform': defaultTargetPlatform.name, 'appVersion': Api.appVersion, 'screen': screen, 'message': e.toString(), 'stack': st?.toString() ?? ''}))
           .timeout(const Duration(seconds: 10));
     } catch (_) {}
   }
@@ -176,10 +171,11 @@ class Telemetry {
 
 class Bio {
   // The phone checks the fingerprint. CSave never sees or stores it.
-  static Future<bool> available() async =>
+  static Future<bool> available() async => kIsWeb ? false :
       await _auth.canCheckBiometrics && (await _auth.getAvailableBiometrics()).isNotEmpty;
 
   static Future<bool> prompt(String reason) async {
+    if (kIsWeb) return false;
     try {
       return await _auth.authenticate(
         localizedReason: reason,
