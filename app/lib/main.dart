@@ -10,6 +10,8 @@ const orange = Color(0xFFD4730A), deep = Color(0xFF9A4A0C), ink = Color(0xFF0B0B
 
 final themeMode = ValueNotifier<ThemeMode>(ThemeMode.dark);
 final appNavigator = GlobalKey<NavigatorState>();
+const _lockGold = Color(0xFFFFC61A);   // same gold as the splash screen
+const _lockWhite = Color(0xFFF5F5F5);
 
 void main() {
   runZonedGuarded(() async {
@@ -121,7 +123,7 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
     hasBio = await Bio.enabled;
     if (hasBio) {
       if (await Bio.prompt('Unlock CSave')) { _open(); return; }
-      if (mounted) setState(() { usePassword = false; err = 'Fingerprint not recognised. Try again, or use your password.'; });
+      if (mounted) setState(() { usePassword = true; err = 'Fingerprint cancelled. Enter your password to continue.'; });   // cancel goes straight to the password
       return;
     }
     if (mounted) setState(() { usePassword = true; err = null; });   // no fingerprint: ask for the password and KEEP the session
@@ -147,33 +149,85 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
     appNavigator.currentState?.pushAndRemoveUntil(MaterialPageRoute(builder: (_) => const Splash(next: Entry())), (_) => false);
   }
 
+  Widget _goldButton(String text, VoidCallback? onTap) => SizedBox(
+        width: double.infinity,
+        height: 52,
+        child: FilledButton(
+          style: FilledButton.styleFrom(
+            backgroundColor: _lockGold,
+            foregroundColor: const Color(0xFF080808),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(26)),
+          ),
+          onPressed: onTap,
+          child: Text(text, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+        ),
+      );
+
   @override
   Widget build(BuildContext context) => Stack(children: [
         widget.child,
         if (locked)
           Positioned.fill(
-            child: Container(
-              color: Theme.of(context).scaffoldBackgroundColor,
-              padding: const EdgeInsets.all(24),
-              child: Center(child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
-                const Text('CSave', style: TextStyle(fontSize: 40, fontWeight: FontWeight.bold)),
-                if (memberName.isNotEmpty) ...[const SizedBox(height: 6), Text(memberName, style: const TextStyle(fontSize: 18))],
-                const SizedBox(height: 24),
-                if (usePassword) ...[
-                  const Text('Enter your password to continue', textAlign: TextAlign.center),
-                  const SizedBox(height: 12),
-                  TextField(controller: pw, obscureText: true, onSubmitted: (_) => unlockWithPassword(), decoration: const InputDecoration(labelText: 'Password')),
-                  const SizedBox(height: 12),
-                  FilledButton(onPressed: busy ? null : unlockWithPassword, child: Text(busy ? 'Checking...' : 'Unlock')),
-                  if (hasBio) TextButton(onPressed: () => setState(() { usePassword = false; err = null; }), child: const Text('Verify via fingerprint')),
-                ] else if (hasBio)
-                  FilledButton(onPressed: busy ? null : unlock, child: const Text('Verify via fingerprint')),
-                if (err != null) Padding(padding: const EdgeInsets.only(top: 10), child: Text(err!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.redAccent))),
-                const SizedBox(height: 24),
-                if (!usePassword) OutlinedButton(onPressed: () => setState(() { usePassword = true; err = null; }), child: const Text('Login with password')),
-                const SizedBox(height: 8),
-                TextButton(onPressed: _signOut, child: const Text('Logout')),
-              ]))),
+            child: Material(
+              color: const Color(0xFF080808),
+              child: SafeArea(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 28),
+                  child: Column(children: [
+                    const SizedBox(height: 32),
+                    Image.asset('assets/logo.png', width: 150, height: 150),
+                    const SizedBox(height: 16),
+                    Text(memberName.toUpperCase(), style: const TextStyle(color: _lockWhite, fontSize: 22, fontWeight: FontWeight.bold)),
+                    const Spacer(),
+                    if (usePassword) ...[
+                      const Text('Enter your password to continue', textAlign: TextAlign.center, style: TextStyle(color: _lockWhite, fontSize: 18)),
+                      const SizedBox(height: 16),
+                      TextField(
+                        controller: pw,
+                        obscureText: true,
+                        style: const TextStyle(color: _lockWhite),
+                        onSubmitted: (_) => unlockWithPassword(),
+                        decoration: InputDecoration(
+                          labelText: 'Password',
+                          labelStyle: const TextStyle(color: _lockGold),
+                          enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: const BorderSide(color: _lockGold)),
+                          focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: const BorderSide(color: _lockGold, width: 2)),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      _goldButton(busy ? 'Checking...' : 'Unlock', busy ? null : unlockWithPassword),
+                      if (hasBio)
+                        TextButton(
+                          onPressed: () => setState(() { usePassword = false; err = null; }),
+                          child: const Text('Verify Fingerprint', style: TextStyle(color: _lockGold)),
+                        ),
+                    ] else if (hasBio) ...[
+                      const Icon(Icons.fingerprint, size: 96, color: _lockGold),
+                      const SizedBox(height: 14),
+                      const Text('Click to log in with Fingerprint', textAlign: TextAlign.center, style: TextStyle(color: _lockWhite, fontSize: 18)),
+                      const SizedBox(height: 18),
+                      _goldButton('Verify Fingerprint', busy ? null : unlock),
+                    ],
+                    if (err != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: Text(err!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.redAccent)),
+                      ),
+                    const Spacer(),
+                    Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                      TextButton(onPressed: _signOut, child: const Text('Logout', style: TextStyle(color: _lockGold, fontSize: 16))),
+                      if (!usePassword) ...[
+                        const Text('|', style: TextStyle(color: _lockGold)),
+                        TextButton(
+                          onPressed: () => setState(() { usePassword = true; err = null; }),
+                          child: const Text('Login with Password', style: TextStyle(color: _lockGold, fontSize: 16)),
+                        ),
+                      ],
+                    ]),
+                    const SizedBox(height: 24),
+                  ]),
+                ),
+              ),
             ),
           ),
       ]);
