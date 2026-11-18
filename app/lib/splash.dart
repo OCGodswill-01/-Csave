@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
-const _gold = Color(0xFFFFC61A);
+/// The gold of the CSave logo (its most common gold colour). Splash and lock screen use this one colour.
+const csaveGold = Color(0xFFFABF09);
+const _gold = csaveGold;
 
 /// Shown while the app opens and loads its first data. Black background, gold logo,
 /// a thin gold line, then the tagline in a gold serif font.
