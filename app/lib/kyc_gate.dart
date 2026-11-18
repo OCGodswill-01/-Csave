@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'api.dart';
 import 'screens.dart';
 import 'splash.dart';
+import 'main.dart';
 
 /// Shown when a member has not finished KYC or has not paid the membership fee.
 /// It says exactly what is missing and links to the right step.
