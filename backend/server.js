@@ -43,7 +43,7 @@ for (const m of ['get', 'post', 'put', 'delete', 'patch']) {
 process.on('unhandledRejection', e => console.error('unhandledRejection:', e && e.message ? e.message : e));
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '6mb' }));
 // Only accept traffic that came through Cloudflare (Cloudflare adds the X-Origin-Secret header).
 // Blocks direct calls to the .onrender.com address, which would otherwise let anyone fake the cf-ipcountry header.
 // Exempt: Flutterwave's webhook and the browser payment return page. They do not carry the header, and both verify payments themselves.
@@ -154,7 +154,7 @@ app.use((req, res, next) => {
 // ---------- AUTH HELPERS ----------
 const sign = u => jwt.sign({ id: u._id, role: u.role, tv: u.tokenVersion || 0 }, process.env.JWT_SECRET, { expiresIn: '12h' });
 // Before KYC is approved AND the membership fee is paid, a member may only use these routes.
-const KYC_GATE_OPEN = ['/api/me', '/api/kyc', '/api/membership/pay'];
+const KYC_GATE_OPEN = ['/api/me', '/api/kyc', '/api/membership/pay', '/api/notifications', '/api/notifications/read'];
 const auth = async (req, res, next) => {
   try {
     const payload = jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), process.env.JWT_SECRET);
@@ -494,7 +494,7 @@ FACTS YOU CAN USE:
 - Savings: every member can open two separate accounts. C Plan is time-based: Withdraw works only when its unlock date arrives. Mission Plan is goal-based: Withdraw works only when the target amount is reached.
 - There is no transfer feature. Money leaves only by Withdraw, to a bank account in the member's own name. If the bank name does not match the CSave name, it is blocked. Withdrawals always need the 4-digit PIN (set in Profile). If fingerprint is on, the phone asks for it as well. Five wrong PINs lock withdrawals for 30 minutes.
 - Membership: a one-time compulsory fee of ₦5,000. Terms and conditions apply. There is no refund feature in the app: never promise a refund, and start your reply with ESCALATE if a member asks for one. Pay from Profile > Membership. After payment the membership ID appears in notifications and is emailed with the cooperative bylaws.
-- KYC: Profile > KYC. Needs phone, date of birth, address, ID type and number, next of kin. Staff review it and the member gets a notification.
+- KYC: Profile > KYC. Needs phone, date of birth, address, ID type and number, next of kin, and four photos taken with the camera: a selfie holding a paper with your full name, the front and back of your ID, and your chosen bill (for example the NEPA bill). Staff review it and the member gets a notification.
 - Referral code: appears on Home only after KYC is approved and the membership fee is paid. When a friend the member referred pays their membership fee, the reward the cooperative has set is paid into the referrer's wallet, once. Quote an amount only if it is in the data you are given; otherwise say the current reward is shown in the app. Never promise a payout date or a reward for anything other than a paid membership.
 - Fingerprint: Profile > Fingerprint switch. The phone checks the fingerprint. The app locks itself when the member leaves it.
 - Forgot password: tap Forgot password on the sign-in screen. A 6-digit code is emailed and works for 10 minutes.
@@ -623,7 +623,8 @@ app.delete('/api/support/faq/:id', ...supportStaff, async (req, res) => { await 
 
 // ---------- NOTIFICATIONS + MEMBERSHIP ID ----------
 const Notif = mongoose.model('Notif', new mongoose.Schema({
-  user: { type: mongoose.Schema.Types.ObjectId, index: true }, title: String, body: String, read: { type: Boolean, default: false }, images: [String] }, { timestamps: true }));
+  user: { type: mongoose.Schema.Types.ObjectId, index: true }, title: String, body: String, read: { type: Boolean, default: false }, images: [String],
+  announcement: { type: mongoose.Schema.Types.ObjectId, index: true } }, { timestamps: true }));   // set only on notifications sent by an announcement, so staff can unsend them
 const Counter = mongoose.model('Counter', new mongoose.Schema({ _id: String, n: Number }));
 const nextMemberNo = async () => (await Counter.findOneAndUpdate({ _id: 'member' }, { $inc: { n: 1 } }, { upsert: true, new: true })).n;
 
@@ -755,8 +756,11 @@ app.post('/api/notifications/read', auth, async (req, res) => { await Notif.upda
 const kycKey = () => /^[0-9a-f]{64}$/i.test(process.env.KYC_KEY || '') ? Buffer.from(process.env.KYC_KEY, 'hex') : tokKey();
 const aesEnc = (key, text) => { const iv = crypto.randomBytes(12), c = crypto.createCipheriv('aes-256-gcm', key, iv), e = Buffer.concat([c.update(text, 'utf8'), c.final()]); return [iv, c.getAuthTag(), e].map(b => b.toString('base64')).join('.'); };
 const aesDec = (key, s) => { const [iv, tag, e] = s.split('.').map(x => Buffer.from(x, 'base64')), d = crypto.createDecipheriv('aes-256-gcm', key, iv); d.setAuthTag(tag); return Buffer.concat([d.update(e), d.final()]).toString('utf8'); };
-const ID_TYPES = ['NIN', 'BVN', 'Voter card', "Driver's licence", 'International passport'];
+const ID_TYPES = ['NIN', 'Voter card', "Driver's licence", 'International passport'];
 const KYC_NEEDED = () => Math.max(1, Number(process.env.KYC_APPROVALS_REQUIRED) || 2);
+// KYC photos are stored encrypted, one row per photo, and are only ever served to staff through the audited endpoint below.
+const KycPhoto = mongoose.model('KycPhoto', new mongoose.Schema({ user: { type: mongoose.Schema.Types.ObjectId, index: true }, slot: String, mime: String, enc: String }, { timestamps: true }));
+const PHOTO_SLOTS = ['selfie', 'idFront', 'idBack', 'proof'];   // selfie holding a paper with the name, front and back of the ID, the chosen bill
 
 app.post('/api/kyc', auth, async (req, res) => {
   const { phone, dob, idType, idNumber, nextOfKin, gender, maritalStatus, occupation, placeOfOrigin, proofOfAddress } = req.body;
@@ -766,10 +770,18 @@ app.post('/api/kyc', auth, async (req, res) => {
   if (!['Single', 'Married', 'Divorced', 'Widowed'].includes(maritalStatus)) return res.status(400).json({ error: 'Pick your marital status.' });
   if (!ID_TYPES.includes(idType)) return res.status(400).json({ error: 'Pick an ID type from the list.' });
   const idNo = String(idNumber).replace(/\s+/g, '');
-  if ((idType === 'NIN' || idType === 'BVN') && !/^\d{11}$/.test(idNo)) return res.status(400).json({ error: `A ${idType} has exactly 11 digits.` });
+  if (idType === 'NIN' && !/^\d{11}$/.test(idNo)) return res.status(400).json({ error: 'A NIN has exactly 11 digits.' });
   if (idNo.length < 6 || idNo.length > 30) return res.status(400).json({ error: 'Check the ID number.' });
   const born = new Date(dob);
   if (isNaN(born.getTime()) || born > new Date(Date.now() - 18 * 365.25 * 86400000) || born < new Date('1900-01-01')) return res.status(400).json({ error: 'You must be 18 or older. Check the date of birth.' });
+  const photoIn = req.body.photos || {}, decoded = {};
+  for (const slot of PHOTO_SLOTS) {
+    const m = /^data:image\/(?:jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/.exec(String(photoIn[slot] || ''));
+    const buf = m ? Buffer.from(m[1], 'base64') : null;
+    if (!buf || !sniff(buf)) return res.status(400).json({ error: 'Take all four photos again: your selfie, the front and back of your ID, and your bill.' });
+    if (buf.length > 1.5 * 1024 * 1024) return res.status(400).json({ error: 'One of the photos is too big. Take it again.' });
+    decoded[slot] = buf;
+  }
   if (!kycKey()) return res.status(503).json({ error: 'KYC is not switched on yet. Please try again later.' });
   const u = await User.findById(req.user.id);
   if (u.kycStatus === 'approved') return res.status(409).json({ error: 'Your KYC is already approved.' });
@@ -777,20 +789,10 @@ app.post('/api/kyc', auth, async (req, res) => {
   const idHash = crypto.createHmac('sha256', kycKey()).update(idNo.toUpperCase()).digest('hex');
   if (await User.exists({ _id: { $ne: u._id }, 'kyc.idHash': idHash }))
     return res.status(409).json({ error: 'This ID number is already registered to another CSave account. Contact customer service if you think this is a mistake.' });
-  let bvnCheck, bvnCheckedAt;
-  if (idType === 'BVN') {                                   // checked against the BVN register through Dojah
-    const v = await verifyBvnForKyc(idNo, u.name, dob);
-    if (v.result === 'notfound') return res.status(422).json({ error: 'We could not find that BVN. Check the number and try again.' });
-    if (v.result === 'mismatch') {
-      log(req, 'KYC_BVN_MISMATCH', { reason: v.reason });
-      return res.status(422).json({ error: v.reason === 'dob'
-        ? 'The date of birth does not match your BVN. Check it and try again.'
-        : 'The name on your CSave account does not match your BVN. Check your full name, including any middle name on your BVN. If it is correct, contact customer service.' });
-    }
-    bvnCheck = v.result;                                    // 'match', 'off' (keys not set) or 'unchecked' (service did not answer)
-    if (v.result === 'match') bvnCheckedAt = new Date();
-  }
-  u.kyc = { phone, address, dob, idType, idLast4: idNo.slice(-4), idNumberEnc: aesEnc(kycKey(), idNo), idHash, nextOfKin, submittedAt: new Date(), bvnCheck, bvnCheckedAt,
+  // Photos are replaced on every submission. Each one is stored encrypted and tagged with its real image type.
+  await KycPhoto.deleteMany({ user: u._id });
+  await KycPhoto.insertMany(PHOTO_SLOTS.map(slot => ({ user: u._id, slot, mime: sniff(decoded[slot]), enc: aesEnc(kycKey(), decoded[slot].toString('base64')) })));
+  u.kyc = { phone, address, dob, idType, idLast4: idNo.slice(-4), idNumberEnc: aesEnc(kycKey(), idNo), idHash, nextOfKin, submittedAt: new Date(),
     gender, maritalStatus, occupation: String(occupation).trim(), placeOfOrigin: String(placeOfOrigin).trim(), proofOfAddress: String(proofOfAddress).trim() };
   u.kycApprovals = []; u.kycStatus = 'pending'; await u.save();           // a new submission starts the approvals again
   log(req, 'KYC_SUBMITTED'); res.json({ ok: true });
@@ -853,8 +855,20 @@ app.get('/api/admin/kyc/:id', auth, requireRole('admin', 'operations'), async (r
   if (!u) return res.status(404).json({ error: 'Member not found.' });
   let idNumber = null; try { if (u.kyc?.idNumberEnc && kycKey()) idNumber = aesDec(kycKey(), u.kyc.idNumberEnc); } catch {}
   log(req, 'KYC_VIEWED', { member: u._id });
-  res.json({ name: u.name, status: u.kycStatus, phone: u.kyc?.phone, address: u.kyc?.address, dob: u.kyc?.dob, gender: u.kyc?.gender, maritalStatus: u.kyc?.maritalStatus, occupation: u.kyc?.occupation, placeOfOrigin: u.kyc?.placeOfOrigin, proofOfAddress: u.kyc?.proofOfAddress, idType: u.kyc?.idType, idNumber, idLast4: u.kyc?.idLast4,
+  const photos = (await KycPhoto.find({ user: u._id }).select('slot').lean()).map(p => p.slot);
+  res.json({ photos, name: u.name, status: u.kycStatus, phone: u.kyc?.phone, address: u.kyc?.address, dob: u.kyc?.dob, gender: u.kyc?.gender, maritalStatus: u.kyc?.maritalStatus, occupation: u.kyc?.occupation, placeOfOrigin: u.kyc?.placeOfOrigin, proofOfAddress: u.kyc?.proofOfAddress, idType: u.kyc?.idType, idNumber, idLast4: u.kyc?.idLast4,
     nextOfKin: u.kyc?.nextOfKin, submittedAt: u.kyc?.submittedAt, bvnCheck: u.kyc?.bvnCheck, bvnCheckedAt: u.kyc?.bvnCheckedAt, approvals: (u.kycApprovals || []).length, approvalsNeeded: KYC_NEEDED() });
+});
+
+// One KYC photo, for staff only. Every view is written to the audit log.
+app.get('/api/admin/kyc/:id/photo/:slot', auth, requireRole('admin', 'operations'), async (req, res) => {
+  const u = await User.findOne({ _id: okId(req.params.id) ? req.params.id : null, role: 'customer' }).select('_id');
+  if (!u) return res.status(404).json({ error: 'Member not found.' });
+  if (!PHOTO_SLOTS.includes(req.params.slot)) return res.status(404).json({ error: 'No such photo.' });
+  const p = await KycPhoto.findOne({ user: u._id, slot: req.params.slot });
+  if (!p || !kycKey()) return res.status(404).json({ error: 'That photo is not on file.' });
+  log(req, 'KYC_PHOTO_VIEWED', { member: u._id, slot: req.params.slot });
+  res.set({ 'Content-Type': p.mime, 'Cache-Control': 'no-store' }).send(Buffer.from(aesDec(kycKey(), p.enc), 'base64'));
 });
 
 // Four-eyes rule: one person can reject, but approval needs KYC_APPROVALS_REQUIRED (default 2) DIFFERENT staff.
@@ -1532,7 +1546,14 @@ app.get('/api/ops/referrals', ...only('operations', 'finance'), async (req, res)
   const names = Object.fromEntries((await User.find({ _id: { $in: refs.map(r => r._id) } }).select('name referralCode')).map(u => [String(u._id), u]));
   res.json(refs.map(r => ({ member: names[String(r._id)]?.name || 'Unknown', code: names[String(r._id)]?.referralCode || '', referred: r.referred, referredPaid: r.paid })));
 });
-const Announcement = mongoose.model('Announcement', new mongoose.Schema({ title: String, body: String, images: [String], by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, sentTo: Number }, { timestamps: true }));
+const Announcement = mongoose.model('Announcement', new mongoose.Schema({ title: String, body: String, images: [String], by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, sentTo: Number, sendAt: Date, sent: { type: Boolean, default: true } }, { timestamps: true }));
+// Sends an announcement to every active member now. Returns how many members received it.
+async function deliverAnnouncement(ann) {
+  const ids = (await User.find({ role: 'customer', active: { $ne: false } }).select('_id')).map(u => u._id);
+  for (let i = 0; i < ids.length; i += 1000) await Notif.insertMany(ids.slice(i, i + 1000).map(user => ({ user, title: ann.title, body: ann.body, images: ann.images, announcement: ann._id })));
+  await Announcement.updateOne({ _id: ann._id }, { sentTo: ids.length, sent: true });
+  return ids.length;
+}
 app.get('/api/ops/announcements', ...OPS, async (req, res) => res.json(await Announcement.find().sort('-createdAt').limit(30).populate('by', 'name')));
 app.post('/api/ops/announcements', ...OPS, async (req, res) => {
   const title = String(req.body.title || '').trim().slice(0, 80), body = String(req.body.body || '').trim().slice(0, 500);
@@ -1540,9 +1561,31 @@ app.post('/api/ops/announcements', ...OPS, async (req, res) => {
   const keys = (Array.isArray(req.body.images) ? req.body.images : []).map(String).filter(k => /^[0-9a-f]{32}$/.test(k)).slice(0, 5);
   if (keys.length && (await Media.countDocuments({ key: { $in: keys } })) !== keys.length) return res.status(400).json({ error: 'One of the images was not found. Upload it again.' });
   const images = keys.map(k => '/api/media/' + k);
-  const ids = (await User.find({ role: 'customer', active: { $ne: false } }).select('_id')).map(u => u._id);
-  for (let i = 0; i < ids.length; i += 1000) await Notif.insertMany(ids.slice(i, i + 1000).map(user => ({ user, title, body, images })));
-  await Announcement.create({ title, body, images, by: req.user.id, sentTo: ids.length }); log(req, 'ANNOUNCEMENT_SENT', { title, sentTo: ids.length }); res.json({ ok: true, sentTo: ids.length });
+  const when = req.body.sendAt ? new Date(req.body.sendAt) : null;
+  if (when && isNaN(when)) return res.status(400).json({ error: 'Pick a valid date and time.' });
+  if (when && when > new Date()) {
+    await Announcement.create({ title, body, images, by: req.user.id, sentTo: 0, sent: false, sendAt: when });
+    log(req, 'ANNOUNCEMENT_SCHEDULED', { title, sendAt: when }); return res.json({ ok: true, scheduled: true, sendAt: when });
+  }
+  const ann = await Announcement.create({ title, body, images, by: req.user.id, sentTo: 0, sent: true });
+  const sentTo = await deliverAnnouncement(ann);
+  log(req, 'ANNOUNCEMENT_SENT', { title, sentTo }); res.json({ ok: true, sentTo });
+});
+// Delete an announcement at any time, new or old. It also removes every member's copy of it from their notifications
+// and the Home banner. Announcements sent before this feature have no link, so their copies are found by the same
+// title, message and pictures, created within 10 minutes of the announcement.
+app.delete('/api/ops/announcements/:id', ...OPS, async (req, res) => {
+  if (!okId(req.params.id)) return res.status(400).json({ error: 'Announcement not found.' });
+  const a = await Announcement.findById(req.params.id);
+  if (!a) return res.status(404).json({ error: 'Announcement not found. It may already be deleted.' });
+  const t = a.createdAt ? a.createdAt.getTime() : Date.now(), win = 10 * 60 * 1000;
+  const r = await Notif.deleteMany({ $or: [
+    { announcement: a._id },
+    { announcement: { $exists: false }, title: a.title, body: a.body, images: a.images || [], createdAt: { $gte: new Date(t - win), $lte: new Date(t + win) } },
+  ] });
+  await Announcement.deleteOne({ _id: a._id });
+  log(req, 'ANNOUNCEMENT_DELETED', { title: a.title, notificationsRemoved: r.deletedCount });
+  res.json({ ok: true, notificationsRemoved: r.deletedCount });
 });
 app.get('/api/ops/budget-defaults', ...OPS, async (req, res) => { const c = await Config.findById('budget'); res.json({ categories: c?.categories?.length ? c.categories : DEFAULT_CATS.map(x => ({ name: x.name, color: x.color })), tasks: c?.tasks?.length ? c.tasks : DEFAULT_TASKS.map(([emoji, text]) => ({ emoji, text })) }); });
 app.post('/api/ops/budget-defaults', ...OPS, async (req, res) => {
@@ -1934,6 +1977,13 @@ try {
   const cron = require('node-cron');
   cron.schedule('5 1 * * *', () => applyInterest().then(r => console.log('Interest applied to', r.applied, 'plans')).catch(e => console.error('interest', e.message)));
   cron.schedule('10 1 * * *', () => settlePendingReferrals().then(r => r.paid && console.log('Referrals paid', r)).catch(e => console.error('referrals', e.message)));
+  cron.schedule('* * * * *', async () => {
+    const due = await Announcement.find({ sent: false, sendAt: { $lte: new Date() } }).select('_id').limit(20);
+    for (const d of due) {
+      const a = await Announcement.findOneAndUpdate({ _id: d._id, sent: false }, { sent: true });   // claim it once
+      if (a) await deliverAnnouncement(a).catch(e => console.error('scheduled announcement', e.message));
+    }
+  });
 } catch (e) { console.warn('node-cron not available; interest cron disabled'); }
 
 // ---------- BANK LIST (the app's withdraw bank picker; read from Flutterwave, cached for a day) ----------
@@ -1943,7 +1993,7 @@ let bankList = { at: 0, banks: [] };
 // "live rate unavailable" instead of showing a made-up number.
 // VERIFY FLW_RATE_URL and the response shape against Flutterwave's live docs before launch.
 const FX_CURRENCIES = ['USD', 'GBP', 'EUR', 'CNY'];
-const FLW_RATE_URL = 'https://api.flutterwave.com/v3/rates';
+const FLW_RATE_URL = process.env.FLW_RATE_URL || 'https://api.flutterwave.com/v3/rates';   // set FLW_RATE_URL on Render once the address is verified
 let fxCache = { at: 0, rates: null };
 async function fetchFlwRate(code) {
   const r = await fetch(`${FLW_RATE_URL}?amount=1&from=${code}&to=NGN`, { headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}` } });
