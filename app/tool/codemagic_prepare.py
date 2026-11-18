@@ -18,7 +18,7 @@ subprocess.run(['flutter', 'create', '.', '--org', 'com.abiacsave', '--project-n
 
 # 3. AndroidManifest
 mp = 'android/app/src/main/AndroidManifest.xml'; m = read(mp)
-perms = ''.join(f'    <uses-permission android:name="android.permission.{p}"/>\n' for p in ['INTERNET', 'USE_BIOMETRIC', 'POST_NOTIFICATIONS', 'RECEIVE_BOOT_COMPLETED'])
+perms = ''.join(f'    <uses-permission android:name="android.permission.{p}"/>\n' for p in ['INTERNET', 'USE_BIOMETRIC', 'POST_NOTIFICATIONS', 'RECEIVE_BOOT_COMPLETED', 'CAMERA'])
 if '<application' not in m: die('manifest has no <application>')
 m = m.replace('<application', perms + '    <application', 1)
 receivers = '''        <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver"/>
