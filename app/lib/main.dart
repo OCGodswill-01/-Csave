@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
@@ -161,8 +160,7 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
     } catch (_) {}
   }
 
-  void _open() { if (mounted) setState(() { locked = false; usePassword = false; pausedAt = null; err = null; busy = false; showPw = false; pw.clear(); }); }
-    _resetIdle();
+  void _open() { if (mounted) setState(() { locked = false; usePassword = false; pausedAt = null; err = null; busy = false; showPw = false; pw.clear(); }); _resetIdle(); }
 
   Future<void> unlock() async {
     if (busy || prompting) return;
