@@ -31,12 +31,14 @@ String friendly(Object e) {
 
 class Api {
   /// Sent with crash reports so the team knows which build crashed.
-  static const appVersion = '1.3.1+9';
+  static const appVersion = '1.3.0+12';
   static String get base => (dotenv.env['API_BASE_URL'] ?? '').trim().replaceAll(RegExp(r'/+$'), '');
   static const _timeout = Duration(seconds: 25);
 
   /// Set by the app shell: called when the server says the sign-in has expired.
   static void Function()? onSessionExpired;
+  /// Set by the app shell: a locked member (KYC not approved or membership unpaid) used a feature.
+  static void Function()? onKycRequired;
 
   static Future<Map<String, String>> _h() async => {
         'Content-Type': 'application/json',
@@ -71,6 +73,10 @@ class Api {
       await store.delete(key: 'token');
       onSessionExpired?.call();
       throw ApiError('Your session expired. Please sign in again.', status: 401);
+    }
+    if (r.statusCode == 403 && map['code'] == 'KYC_REQUIRED') {
+      onKycRequired?.call();
+      throw ApiError('Complete your KYC and membership to use this.', status: 403);
     }
     if (r.statusCode == 403 && map.isEmpty) {
       // Not a CSave JSON answer: usually the request was blocked before it reached the app server.
