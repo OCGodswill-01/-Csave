@@ -1,16 +1,21 @@
 import 'dart:async';
+import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'api.dart';
 import 'screens.dart';
 import 'notify.dart';
 import 'splash.dart';
+import 'kyc_gate.dart';
 
 const orange = Color(0xFFD4730A), deep = Color(0xFF9A4A0C), ink = Color(0xFF0B0B0B), panel = Color(0xFF1A1A1A);
 
 final themeMode = ValueNotifier<ThemeMode>(ThemeMode.dark);
 final appNavigator = GlobalKey<NavigatorState>();
-const _lockGold = Color(0xFFFFC61A);   // same gold as the splash screen
+const _lockGold = csaveGold;
+bool kycGateOpen = false;
+/// Browser only: after this long without a tap or click, the app asks for the password again.
+const webIdleLock = Duration(seconds: 90);   // 1.5 minutes with no touch and no key press   // the KYC gate screen is shown once at a time   // same gold as the splash screen and the logo
 const _lockWhite = Color(0xFFF5F5F5);
 
 void main() {
@@ -78,6 +83,9 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
   bool locked = false, usePassword = false, busy = false, hasBio = false;
   DateTime? pausedAt;
   String? err;
+  bool showPw = false;          // eye icon: show or hide the typed password
+  bool prompting = false;      // a fingerprint prompt is on screen
+  bool autoPrompted = false;   // the fingerprint was already asked for in this lock
   final pw = TextEditingController();
   String memberName = '';
 
@@ -85,6 +93,21 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _resetIdle();
+    if (kIsWeb) HardwareKeyboard.instance.addHandler(_keyActivity);
+    // Cold start: a member who is already signed in unlocks once the splash has shown (2 seconds).
+    Future.delayed(const Duration(seconds: 2), () async {
+      if (!mounted) return;
+      if (await store.read(key: 'token') != null) {
+        setState(() { locked = true; usePassword = false; err = null; showPw = false; });
+        unlock();
+      }
+    });
+    Api.onKycRequired = () {
+      if (!mounted || kycGateOpen) return;
+      kycGateOpen = true;
+      appNavigator.currentState?.push(MaterialPageRoute(builder: (_) => const KycGateScreen())).then((_) => kycGateOpen = false);
+    };
     Api.onSessionExpired = () {
       if (!mounted) return;
       ScaffoldMessenger.maybeOf(context)?.showSnackBar(const SnackBar(content: Text('Your session expired. Please sign in again.')));
@@ -94,17 +117,38 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
   }
 
   @override
-  void dispose() { WidgetsBinding.instance.removeObserver(this); pw.dispose(); super.dispose(); }
+  void dispose() { _idle?.cancel(); HardwareKeyboard.instance.removeHandler(_keyActivity); WidgetsBinding.instance.removeObserver(this); pw.dispose(); super.dispose(); }
+
+  Timer? _idle;
+  bool _keyActivity(KeyEvent e) { _resetIdle(); return false; }   // typing counts as activity
+  void _resetIdle() {
+    if (!kIsWeb) return;
+    _idle?.cancel();
+    _idle = Timer(webIdleLock, _idleLock);
+  }
+  Future<void> _idleLock() async {
+    if (!mounted || locked) return;
+    if (await store.read(key: 'token') != null) {
+      setState(() { locked = true; usePassword = true; err = null; showPw = false; });
+    }
+  }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState s) async {
-    // Only lock on paused (background). inactive fires for the notification shade.
+    // Only lock on paused (background). inactive fires for the notification shade and the fingerprint sheet.
     if (s == AppLifecycleState.paused) {
-      if (await store.read(key: 'token') != null) { pausedAt ??= DateTime.now(); if (mounted) setState(() { locked = true; usePassword = false; err = null; }); _loadName(); }
+      if (prompting) return;   // the fingerprint sheet itself must never lock the app or ask again
+      if (await store.read(key: 'token') != null) {
+        pausedAt ??= DateTime.now();
+        autoPrompted = false;
+        if (mounted) setState(() { locked = true; usePassword = false; err = null; showPw = false; });
+        _loadName();
+      }
     }
-    if (s == AppLifecycleState.resumed && locked) {
-      hasBio = await Bio.enabled;
-      unlock();
+    // Ask for the fingerprint once per lock. A cancel or failure goes to the password and is NOT asked again by itself.
+    if (s == AppLifecycleState.resumed && locked && !autoPrompted && !prompting) {
+      autoPrompted = true;
+      await unlock();
     }
   }
 
@@ -116,31 +160,45 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
     } catch (_) {}
   }
 
-  void _open() { if (mounted) setState(() { locked = false; usePassword = false; pausedAt = null; err = null; busy = false; pw.clear(); }); }
+  void _open() { if (mounted) setState(() { locked = false; usePassword = false; pausedAt = null; err = null; busy = false; showPw = false; pw.clear(); }); }
+    _resetIdle();
 
   Future<void> unlock() async {
-    if (busy) return;
-    hasBio = await Bio.enabled;
-    if (hasBio) {
-      if (await Bio.prompt('Unlock CSave')) { _open(); return; }
-      if (mounted) setState(() { usePassword = true; err = 'Fingerprint cancelled. Enter your password to continue.'; });   // cancel goes straight to the password
-      return;
+    if (busy || prompting) return;
+    prompting = true;
+    try {
+      hasBio = await Bio.enabled;
+      if (hasBio) {
+        final ok = await Bio.prompt('Unlock CSave');
+        if (ok) { _open(); return; }
+        // Cancel or failure: go to the password and stop. Nothing re-opens the fingerprint by itself.
+        if (mounted) setState(() { usePassword = true; err = 'Fingerprint cancelled. Enter your password to continue.'; });
+        return;
+      }
+      // No fingerprint: ask for the password and KEEP the session.
+      if (mounted) setState(() { usePassword = true; err = null; });
+    } catch (_) {
+      if (mounted) setState(() { usePassword = true; err = 'Fingerprint could not be checked. Enter your password to continue.'; });
+    } finally {
+      prompting = false;
     }
-    if (mounted) setState(() { usePassword = true; err = null; });   // no fingerprint: ask for the password and KEEP the session
   }
 
   Future<void> unlockWithPassword() async {
-    final email = await store.read(key: 'email');
-    if (email == null) { await _signOut(); return; }
+    if (busy) return;
+    final typed = pw.text;
+    if (typed.isEmpty) { setState(() => err = 'Enter your password.'); return; }
     setState(() { busy = true; err = null; });
     try {
-      final signedIn = await Api.login(email, pw.text);
-      if (!signedIn) { await _signOut(); return; }   // staff also need an emailed code: full sign-in
+      final email = await store.read(key: 'email');
+      if (email == null) { await _signOut(); return; }
+      final signedIn = await Api.login(email, typed);
+      if (!signedIn) { await _signOut(); return; }   // staff and new devices also need an emailed code: full sign-in
       _open();
     } catch (e) {
-      if (mounted) setState(() => err = friendly(e));
+      if (mounted) setState(() { err = friendly(e); busy = false; });
     }
-    if (mounted) setState(() => busy = false);
+    if (mounted && busy) setState(() => busy = false);
   }
 
   Future<void> _signOut() async {
@@ -165,7 +223,7 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) => Stack(children: [
-        widget.child,
+        Listener(behavior: HitTestBehavior.translucent, onPointerDown: (_) => _resetIdle(), child: widget.child),
         if (locked)
           Positioned.fill(
             child: Material(
@@ -184,12 +242,17 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
                       const SizedBox(height: 16),
                       TextField(
                         controller: pw,
-                        obscureText: true,
+                        obscureText: !showPw,
                         style: const TextStyle(color: _lockWhite),
                         onSubmitted: (_) => unlockWithPassword(),
                         decoration: InputDecoration(
                           labelText: 'Password',
                           labelStyle: const TextStyle(color: _lockGold),
+                          suffixIcon: IconButton(
+                            tooltip: showPw ? 'Hide password' : 'Show password',
+                            icon: Icon(showPw ? Icons.visibility_off : Icons.visibility, color: _lockGold),
+                            onPressed: () => setState(() => showPw = !showPw),
+                          ),
                           enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: const BorderSide(color: _lockGold)),
                           focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: const BorderSide(color: _lockGold, width: 2)),
                         ),
