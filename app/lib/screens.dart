@@ -1,4 +1,7 @@
+import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'api.dart';
 import 'autosave.dart';
@@ -245,7 +248,9 @@ class HomePage extends StatefulWidget {
 class _HomeState extends State<HomePage> {
   late Future f = Api.call('GET', '/api/me');
   late Future ban = Api.call('GET', '/api/announcements/banners');
-  void refresh() => setState(() { f = Api.call('GET', '/api/me'); ban = Api.call('GET', '/api/announcements/banners'); });
+  late Future plansF = Api.call('GET', '/api/plans');
+  bool showTotal = false;   // the eye on the dashboard: hidden until the member taps it
+  void refresh() => setState(() { f = Api.call('GET', '/api/me'); ban = Api.call('GET', '/api/announcements/banners'); plansF = Api.call('GET', '/api/plans'); });
 
   @override
   Widget build(BuildContext context) => FutureBuilder(
@@ -268,7 +273,19 @@ class _HomeState extends State<HomePage> {
                   child: BannerCarousel(urls: l.map((x) => x['url'] as String).toList(), onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const NotificationsPage()))))));
             }),
             const Text('Total savings'),
-            const Text('₦ ••••••', style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold)),
+            FutureBuilder(future: plansF, builder: (c, s) {
+              final plans = s.hasData ? List<Map>.from(s.data as List) : <Map>[];
+              final total = plans.fold<num>(0, (t, p) => t + ((p['balance'] as num?) ?? 0));
+              final shown = !showTotal ? '₦ ••••••' : s.hasError ? 'Unavailable' : !s.hasData ? 'Loading...' : naira(total);
+              return Row(children: [
+                Expanded(child: Text(shown, style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold))),
+                IconButton(
+                  tooltip: showTotal ? 'Hide amount' : 'Show amount',
+                  icon: Icon(showTotal ? Icons.visibility_off : Icons.visibility),
+                  onPressed: () => setState(() => showTotal = !showTotal),
+                ),
+              ]);
+            }),
             const SizedBox(height: 20),
             // No Transfer button by design. Withdraw lives inside each plan.
             Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
@@ -665,11 +682,31 @@ class _KycState extends State<KycScreen> {
   final f = {for (var k in ['phone', 'residentialAddress', 'placeOfOrigin', 'occupation', 'dob', 'idNumber', 'nextOfKin']) k: TextEditingController()};
   String idType = 'NIN'; String? err; bool busy = false;
   String? gender, marital, proof;
+  // Camera photos only: selfie holding a paper with the name, front and back of the ID, and the bill chosen above.
+  final Map<String, Uint8List> photos = {};
+  static const slots = ['selfie', 'idFront', 'idBack', 'proof'];
+
+  Future<void> takePhoto(String slot) async {
+    try {
+      final shot = await ImagePicker().pickImage(source: ImageSource.camera, maxWidth: 1280, maxHeight: 1280, imageQuality: 75);
+      if (shot == null) return;
+      final bytes = await shot.readAsBytes();
+      if (mounted) setState(() { photos[slot] = bytes; err = null; });
+    } catch (_) {
+      if (mounted) setState(() => err = 'The camera could not open. Allow camera access and try again.');
+    }
+  }
 
   Future<void> submit() async {
+    if (proof == null) { setState(() => err = 'Choose the type of bill first.'); return; }
+    if (slots.any((s) => !photos.containsKey(s))) { setState(() => err = 'Take all four photos before you submit.'); return; }
     setState(() { busy = true; err = null; });
     try {
-      await Api.call('POST', '/api/kyc', {for (var e in f.entries) e.key: e.value.text.trim(), 'idType': idType, 'gender': gender, 'maritalStatus': marital, 'proofOfAddress': proof});
+      await Api.call('POST', '/api/kyc', {
+        for (var e in f.entries) e.key: e.value.text.trim(),
+        'idType': idType, 'gender': gender, 'maritalStatus': marital, 'proofOfAddress': proof,
+        'photos': {for (var e in photos.entries) e.key: 'data:image/jpeg;base64,${base64Encode(e.value)}'},
+      });
       if (mounted) { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('KYC submitted. We will review it.'))); Navigator.pop(context); }
     } catch (e) { setState(() => err = friendly(e)); }
     if (mounted) setState(() => busy = false);
@@ -677,6 +714,30 @@ class _KycState extends State<KycScreen> {
 
   Widget _t(String k, String label, [TextInputType? t]) => Padding(padding: const EdgeInsets.only(bottom: 10),
       child: TextField(controller: f[k], keyboardType: t, decoration: InputDecoration(labelText: label)));
+
+  Widget _photo(String slot, String label) {
+    final bytes = photos[slot];
+    final enabled = slot != 'proof' || proof != null;
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(label),
+          const SizedBox(height: 8),
+          if (bytes != null)
+            ClipRRect(borderRadius: BorderRadius.circular(8),
+                child: Image.memory(bytes, height: 180, width: double.infinity, fit: BoxFit.cover)),
+          if (bytes != null) const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: !enabled || busy ? null : () => takePhoto(slot),
+            icon: const Icon(Icons.photo_camera),
+            label: Text(bytes == null ? 'Take photo' : 'Retake'),
+          ),
+        ]),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -693,16 +754,25 @@ class _KycState extends State<KycScreen> {
           _t('occupation', 'Occupation'),
           _t('placeOfOrigin', 'Place of origin (state and LGA)'),
           _t('residentialAddress', 'Residential address (where you live now)'),
-          DropdownButtonFormField<String>(value: proof, decoration: const InputDecoration(labelText: 'Proof of address'),
+          DropdownButtonFormField<String>(value: proof, decoration: const InputDecoration(labelText: 'Which bill will you photograph?'),
               items: ['NEPA bill', 'Water bill', 'Tenancy agreement', 'Bank statement', 'Other utility bill'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(), onChanged: (v) => setState(() => proof = v)),
           const SizedBox(height: 10),
           DropdownButtonFormField<String>(value: idType, decoration: const InputDecoration(labelText: 'ID type'),
-              items: ['NIN', 'BVN', 'Voter card', "Driver's licence", 'International passport'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
+              items: ['NIN', 'Voter card', "Driver's licence", 'International passport'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
               onChanged: (v) => setState(() => idType = v!)),
           const SizedBox(height: 10),
           _t('idNumber', 'ID number'),
           _t('nextOfKin', 'Next of kin (name and phone)'),
-          const Text('Your ID number is stored encrypted. Staff open it only to check your ID. Staff lists show just the last 4 digits.', style: TextStyle(color: Colors.grey, fontSize: 12)),
+          const SizedBox(height: 8),
+          const Text('Photos', style: TextStyle(fontWeight: FontWeight.w600)),
+          const SizedBox(height: 4),
+          const Text('Take each photo now with your camera. Photos from your gallery are not accepted.', style: TextStyle(color: Colors.grey, fontSize: 12)),
+          const SizedBox(height: 10),
+          _photo('selfie', '1. Selfie holding a paper with your full name written on it'),
+          _photo('idFront', '2. Front of your ID'),
+          _photo('idBack', '3. Back of your ID'),
+          _photo('proof', proof == null ? '4. Choose the bill type above first' : '4. Photo of your $proof'),
+          const Text('Your ID number and photos are stored encrypted. Staff open them only to check your identity. Staff lists show just the last 4 digits.', style: TextStyle(color: Colors.grey, fontSize: 12)),
           if (err != null) Padding(padding: const EdgeInsets.only(top: 10), child: Text(err!, style: const TextStyle(color: Colors.redAccent))),
           const SizedBox(height: 16),
           FilledButton(style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(52)), onPressed: busy ? null : submit, child: const Text('Submit KYC')),
