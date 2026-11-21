@@ -1,3 +1,4 @@
+[README.md](https://github.com/user-attachments/files/35221082/README.md)
 
 ## Keys (server .env only, never in the app)
 DEEPSEEK_API_KEY  -> AI customer service (/api/ai/chat)
@@ -70,7 +71,59 @@ RESEND_API_KEY    -> emails. EMAIL_FROM must be a domain verified in Resend (onb
 ## Payment return page, BVN checks (Dojah), health monitor
 
 - **Payment return page**: Flutterwave now sends members to `https://<your-server>/pay/return`. Set `PAYMENT_REDIRECT_URL` in Render to that address (or set `PUBLIC_BASE_URL` and the page is used automatically). The page asks Flutterwave whether the payment really went through, then uses the same safe, idempotent path as the webhook. Optional: `PAYMENT_BACK_URL` adds a "Back to CSave" button.
-- **BVN checks through Dojah**: set `DOJAH_APP_ID` and `DOJAH_SECRET_KEY` (Dojah dashboard). When a member submits a BVN as their ID, the BVN record is checked: the name must match the CSave account name (word order and a missing middle name are allowed) and the date of birth must match when it can be read. A name or date mismatch is refused with a message. A BVN that Dojah cannot find is refused. If Dojah does not answer, the submission still goes to staff, marked **NOT CHECKED** in the View ID dialog, so an outage never blocks members. The BVN number is still stored encrypted, and only the outcome is kept, not the name Dojah returns.
+- **Automatic ID check through Dojah**: set `DOJAH_APP_ID` and `DOJAH_SECRET_KEY` in Render (Dojah dashboard). From then on every new **NIN** is looked up and compared with the member's name (word order and a missing middle name are allowed) and date of birth. Staff see the result in **View ID** (matches / name or date does not match / not found / could not be checked) and still approve by hand. Without the keys nothing breaks: submissions go to staff marked "not checked automatically". Other ID types are always checked by hand. Optional `DOJAH_BLOCK_MISMATCH=1` also tells the member at once when the NIN is not found or does not match. BVN is no longer asked for. The code is in `idcheck.js` (tests: `test/idcheck.test.js`); it could not be tried against the live Dojah service while building, so test it once with real keys and a real NIN.
 - **Health monitor**: runs inside the server every 5 minutes, for as long as the server is live. Staff see it in **Technical → Health monitor**: an overall green, amber or red status, the open problems with what to do about each, and problems resolved in the last 7 days. It watches stuck payments, withdrawals that need a person, overdue KYC, auto-save failures, the payment re-check job, the crash rate, failed sign-ins, unused staff accounts, and missing settings. Critical problems also trigger an alert to ALERT_EMAIL or ALERT_WEBHOOK_URL (once per problem every 10 minutes). **Explain and prioritise with AI** sends only the problem list to DeepSeek (no names, emails or secrets) and asks for a ranked plan.
 - **Tests**: `npm test` now also runs `test/bvn.test.js` and `test/health.test.js`.
 - No Flutter changes are needed: the KYC screen already has a BVN option and shows the server's messages.
+
+## Delete announcements (v11)
+
+- Staff console > Operations > Announcements: every announcement in the list has a **Delete** button, new or old.
+- Deleting removes the announcement, the Home banner pictures, and every member's copy in their Notifications. It asks for confirmation first and is written to the Audit log (`ANNOUNCEMENT_DELETED`).
+- Endpoint: `DELETE /api/ops/announcements/:id` (operations and admin only).
+- Announcements sent from now on are linked to their notifications. Older ones are matched by the same title, message and pictures sent within 10 minutes of the announcement.
+- Members see the change the next time their notifications refresh.
+
+## Account deletion (Google Play requirement)
+
+- **Public page**: `https://api.abiacsave.com.ng/account-deletion` (also `/delete-account`). Put this address in Play Console > App content > Data safety > Account deletion link. It shows the app and developer name, both ways to delete, what is erased and what is kept.
+- **In the app**: Profile > **Delete my account** (asks for the password). Server: `POST /api/me/delete-account`. Web page form: `POST /api/account/delete` (email and password, limited to 6 tries per 15 minutes).
+- **Rules**: blocked while the wallet or any plan holds money, or a withdrawal or payment is unfinished. Staff accounts cannot self-delete.
+- **Erased**: name, email, KYC details and photos, PIN, saved card token, budgets, expenses, goals, reminders, notifications, coach chats and tickets. The login is closed and every phone is signed out.
+- **Kept without a name**: ledger, payment and withdrawal records and the audit log (your policy says six years).
+- Set `SUPPORT_EMAIL` in Render to show a contact address on the page. Audit log action: `ACCOUNT_DELETED`.
+- Tests: `test/account-delete.test.js` (part of `npm test`).
+
+## My details and profile picture
+
+- Profile > **My details** shows the member what CSave holds about them: name, email, member since, membership ID, KYC status, the KYC details they submitted (phone, address, date of birth, gender, marital status, occupation, place of origin, next of kin, proof of address type), the last 4 digits of the ID, and which KYC photos are on file. The full ID number and the photos are never sent to the phone. Server: `GET /api/me/details`.
+- Private rows (phone, address, date of birth, next of kin, place of origin, ID digits) are hidden: the server does not send them. The member taps **Show hidden details** and enters their password (`POST /api/me/details/reveal`, rate limited, logged as `DETAILS_REVEALED`). A member who turned on **Fingerprint** in Profile can use it instead of typing the password. They hide again when the screen closes or on **Hide again**.
+- Profile > tap the round picture: take a photo, choose from the gallery, or remove it. The app shrinks it to 512 px first. Server: `GET`, `POST`, `DELETE /api/me/photo` (max 600 KB, real JPEG/PNG/WebP only, 20 changes an hour). It is erased with the account.
+- Tests: `test/member-details.test.js` (part of `npm test`).
+
+## Savings limit (v18)
+
+- For now a member can keep at most **₦300,000 in total** (across their plans). Set by `SAVINGS_CAP` in Render (default 300000). Raise it there later, no new release needed.
+- It is checked **before the member pays** (adding money to a plan, setting up auto-save), because money that has already reached Flutterwave cannot be refused afterwards.
+- A scheduled auto-save that would go over the limit is not charged. It is paused and the member is told once.
+- Members are told in three places: a tick box on the KYC screen (the server refuses a KYC submission without `limitAck`), a line on the Membership screen, and a sentence added to the auto-save consent text.
+- Blocked attempts are written to the audit log as `LIMIT_BLOCKED`. The KYC tick time is saved as `limitAckAt`.
+- Known gaps: a member who starts several payments at the same moment could slip a little over; a payment already started before the limit was lowered is still credited. Both are small. Staff credits are not checked.
+- **The app and server must be released together**: the old app does not send `limitAck`, so its KYC submissions would be refused.
+- Tests: `test/limits.test.js` (part of `npm test`).
+
+> Older sections above describe earlier versions and still mention the wallet. The section below is the current rule: there is no wallet.
+
+## No wallet (v19)
+
+There is no wallet any more. Money only ever goes into a member's plan (C Plan or Mission Plan), and every payment is written into that plan's record.
+
+- **Paying:** Add money on a plan or Home > Add money opens the Flutterwave page, the member pays with their card, and the amount shows in that plan when they come back. Auto-save works the same way, per plan. Withdrawals go only to a bank account in the member's own name.
+- **Removed from the server:** the wallet balance, wallet funding, wallet-to-plan moves and the staff "Credit wallet" button. `MANUAL_CREDIT_MAX` is no longer used.
+- **A payment that arrives after a plan was paused** is now still written into that plan (it used to be kept in a wallet).
+- **A second membership payment** (membership already paid) is recorded as `extra_payment`, the member is told it will be refunded, and ops are alerted to refund it in Flutterwave.
+- **Referral rewards** are now added to the referrer's first savings plan. If the referrer has no plan yet, the reward waits and is paid once they open one. Staff can change nothing about this except the reward rule itself.
+- **Finance:** the summary and trial balance no longer have wallet lines. Total held for members is the sum of plan balances.
+- **Account deletion** only needs the plans to be empty.
+- **Still in the project, delete by hand:** `app/lib/wallet.dart` and the three wallet helpers in `app/lib/api.dart` (`wallet`, `fundWallet`, `transferToPlan`), `seed-demo.js` wallet lines, and the old `wallets` collection in MongoDB (empty it first). They were not in the changed-files zip so I could not edit them safely.
+- A payment started in the old wallet flow before this release will not be credited. Release before real members use it.
