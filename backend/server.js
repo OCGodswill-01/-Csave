@@ -8,10 +8,13 @@ const helmet = require('helmet');
 const path = require('path');
 const cors = require('cors');
 const crypto = require('crypto');
-const { creditWallet, creditWalletOnce, creditPlanOnce, debitWallet, creditPlan, payInterest } = require('./money');   // atomic balance changes
+const { creditPlanOnce, payInterest } = require('./money');   // atomic balance changes
 const { MEMBERSHIP_FEE, normaliseRule, rewardFor, rewardBlocker } = require('./referral');   // referral rewards (pure rules)
 const CHG = require('./changes');                                                              // interest and referral approvals (pure rules)
-const { lookupBvn, matchBvn } = require('./bvn');                                              // BVN checks through Dojah
+const { memberDetails, parseProfilePhoto } = require('./member-details');                // My details screen + profile picture
+const { deletionBlocker, erasedUser, deletePageHtml } = require('./account-delete');      // account deletion (Google Play requirement)
+const { capFor, checkRoom, limitMessage, limitNotice } = require('./limits');   // savings limit (default 300,000 in total per member)
+const { checkKycId } = require('./idcheck');                                                    // automatic ID check through Dojah (starts when the keys are set)
 const { evaluateHealth, overallStatus } = require('./health');                                // health monitor rules (pure)
 
 // Startup validation — refuse to boot with critical misconfiguration
@@ -48,7 +51,7 @@ app.use(express.json({ limit: '6mb' }));
 // Blocks direct calls to the .onrender.com address, which would otherwise let anyone fake the cf-ipcountry header.
 // Exempt: Flutterwave's webhook and the browser payment return page. They do not carry the header, and both verify payments themselves.
 const ORIGIN_SECRET = process.env.ORIGIN_SECRET || '';
-const originExempt = req => req.path === '/api/webhooks/flutterwave' || req.path === '/pay/return';
+const originExempt = req => req.path === '/api/webhooks/flutterwave' || req.path === '/pay/return' || (req.method === 'GET' && (req.path === '/delete-account' || req.path === '/account-deletion'));
 app.use((req, res, next) => {
   if (originExempt(req)) return next();
   const got = Buffer.from(String(req.get('x-origin-secret') || ''));
@@ -75,15 +78,16 @@ const User = mongoose.model('User', new mongoose.Schema({
   pinHash: String,                                // 4-digit withdrawal PIN (hashed)
   role: { type: String, enum: ['customer','admin','finance','operations','support','tech'], default: 'customer' },
   kycStatus: { type: String, enum: ['none','pending','approved','rejected'], default: 'none' },
-  kyc: { phone: String, address: String, dob: String, idType: String, idLast4: String, idNumberEnc: String, idHash: { type: String, index: true }, nextOfKin: String, submittedAt: Date, bvnCheck: String, bvnCheckedAt: Date,
+  kyc: { phone: String, address: String, dob: String, idType: String, idLast4: String, idNumberEnc: String, idHash: { type: String, index: true }, nextOfKin: String, submittedAt: Date, idCheck: String, idCheckReason: String, idCheckedAt: Date,
     gender: String, maritalStatus: String, occupation: String, placeOfOrigin: String, proofOfAddress: String },
   kycRejectReason: String, kycRejectedAt: Date,
   kycApprovals: [{ _id: false, by: mongoose.Schema.Types.ObjectId, at: Date }],   // two different staff must approve (KYC_APPROVALS_REQUIRED)
+  limitAckAt: Date,                                // member confirmed they read the savings limit (KYC step)
   aiConsentAt: Date,                               // member agreed to AI features that send their data to the AI provider
   membershipPaid: { type: Boolean, default: false }, membershipPaidAt: Date, membershipFlwId: String, membershipId: { type: String, index: true }, membershipEmailSent: Boolean,
   referralCode: { type: String, index: true },
   resetCodeHash: String, resetExpires: Date, resetFails: { type: Number, default: 0 },
-  active: { type: Boolean, default: true }, lastLoginAt: Date, referredBy: { type: mongoose.Schema.Types.ObjectId, index: true },
+  active: { type: Boolean, default: true }, deactivatedAt: Date, deactivatedReason: String, deletedAt: Date, lastLoginAt: Date, referredBy: { type: mongoose.Schema.Types.ObjectId, index: true },
   otpHash: String, otpExpires: Date, otpFails: { type: Number, default: 0 },
   pendingDevice: String, trustedDevices: { type: [String], default: [] },
   pinFails: { type: Number, default: 0 }, pinLockedUntil: Date,
@@ -109,21 +113,13 @@ const planSchema = new mongoose.Schema({
 planSchema.index({ user: 1, type: 1 }, { unique: true }); // max one of each per user
 const Plan = mongoose.model('Plan', planSchema);
 
-// Wallet: one per member
-const Wallet = mongoose.model('Wallet', new mongoose.Schema({
-  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', unique: true },
-  balance: { type: Number, default: 0 },
-  processed: { type: [String], select: false },   // payment ids already applied (makes crediting safe to retry)
-}, { timestamps: true }));
-
 // Ledger: backbone of every money movement (idempotency + reconciliation)
 const Ledger = mongoose.model('Ledger', new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
-  kind: { type: String, index: true }, // wallet_fund, wallet_to_plan, plan_deposit, withdraw, interest, refund, reversal, admin_adjust, membership, auto_debit
+  kind: { type: String, index: true }, // plan_deposit, withdraw, interest, referral_reward, reversal, admin_adjust, membership, extra_payment
   amount: Number,
   balanceAfter: Number,
   plan: mongoose.Schema.Types.ObjectId,
-  wallet: mongoose.Schema.Types.ObjectId,
   ref: { type: String, index: true },
   flwId: { type: String, unique: true, sparse: true },
   meta: Object,
@@ -154,7 +150,7 @@ app.use((req, res, next) => {
 // ---------- AUTH HELPERS ----------
 const sign = u => jwt.sign({ id: u._id, role: u.role, tv: u.tokenVersion || 0 }, process.env.JWT_SECRET, { expiresIn: '12h' });
 // Before KYC is approved AND the membership fee is paid, a member may only use these routes.
-const KYC_GATE_OPEN = ['/api/me', '/api/kyc', '/api/membership/pay', '/api/notifications', '/api/notifications/read'];
+const KYC_GATE_OPEN = ['/api/me', '/api/me/details', '/api/me/details/reveal', '/api/me/photo', '/api/me/delete-account', '/api/kyc', '/api/membership/pay', '/api/notifications', '/api/notifications/read'];
 const auth = async (req, res, next) => {
   try {
     const payload = jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), process.env.JWT_SECRET);
@@ -270,9 +266,29 @@ app.get('/api/me', auth, async (req, res) => {
   if (u.kycStatus === 'approved' && u.membershipPaid && !u.referralCode) { u.referralCode = await makeReferral(u); await u.save(); }
   const eligible = u.kycStatus === 'approved' && u.membershipPaid;
   res.json({ name: u.name, email: u.email, role: u.role, kycStatus: u.kycStatus, kycRejectReason: u.kycStatus === 'rejected' ? (u.kycRejectReason || null) : null, hasPin: !!u.pinHash,
-    membershipPaid: u.membershipPaid, membershipId: u.membershipId, referralCode: eligible ? u.referralCode : null, referralReward: eligible ? await currentReferralRewardText() : null, aiConsent: !!u.aiConsentAt });
+    membershipPaid: u.membershipPaid, membershipId: u.membershipId, referralCode: eligible ? u.referralCode : null, referralReward: eligible ? await currentReferralRewardText() : null, aiConsent: !!u.aiConsentAt, savingsCap: capFor(), limitNotice: limitNotice(capFor()) });
 });
 
+// The member's own referral dashboard. Names are shortened, so no one sees another member's full name.
+app.get('/api/me/referrals', auth, async (req, res) => {
+  const rule = await currentRule();
+  const rv = rewardNow(rule);
+  const rows = await Referral.find({ referrer: req.user.id }).sort('-createdAt').limit(500).populate('referee', 'name').populate('plan', 'title type');
+  const withdrawals = {};
+  for (const r of rows.filter(x => x.status === 'paid' && x.withdrawnAt)) {
+    const k = r.withdrawTx || String(r.withdrawnAt);
+    withdrawals[k] = withdrawals[k] || { at: r.withdrawnAt, amount: 0, count: 0 };
+    withdrawals[k].amount += r.amount || 0; withdrawals[k].count++;
+  }
+  res.json({
+    ruleText: ruleText(rule), rewardNow: rv, totals: referralTotals(rows, rv),
+    referrals: rows.map(r => ({ id: r._id, name: r.referee ? shortName(r.referee.name) : 'Deleted member', joined: r.createdAt,
+      status: r.status === 'paid' ? (r.withdrawnAt ? 'withdrawn' : 'credited') : r.status === 'pending' ? 'waiting' : 'skipped',
+      amount: r.status === 'paid' ? r.amount : (rv || 0), creditedAt: r.paidAt || null, plan: r.plan?.title || null,
+      withdrawnAt: r.withdrawnAt || null, reason: r.status === 'pending' ? (r.reason || '') : '' })),
+    withdrawals: Object.values(withdrawals).sort((x, y) => new Date(y.at) - new Date(x.at)),
+  });
+});
 app.post('/api/me/pin', auth, async (req, res) => {
   if (!/^\d{4}$/.test(req.body.pin || '')) return res.status(400).json({ error: 'PIN must be exactly 4 digits.' });
   await User.findByIdAndUpdate(req.user.id, { pinHash: await bcrypt.hash(req.body.pin, 12), pinFails: 0 });
@@ -343,6 +359,7 @@ app.post('/api/plans/:id/withdraw', auth, wdLimit, async (req, res) => {
   if (!taken) return res.status(409).json({ error: 'Nothing to withdraw.' });
   const ref = `csave_wd_${plan._id}_${Date.now()}`;
   const tx = await Tx.create({ plan: plan._id, user: req.user.id, kind: 'withdraw', amount, status: 'processing', ref });   // written BEFORE the payout, so it can never be lost
+  await Referral.updateMany({ plan: plan._id, status: 'paid', withdrawnAt: { $exists: false } }, { $set: { withdrawnAt: new Date(), withdrawTx: ref } });   // referral money leaves with this plan
   let t;
   try { t = await flw('/transfers', { account_bank: bankCode, account_number: accountNumber, amount, currency: 'NGN', narration: 'CSave withdrawal', reference: ref }); }
   catch (e) {                                                  // network error: the payout may or may not have gone out. Do NOT refund automatically.
@@ -353,6 +370,7 @@ app.post('/api/plans/:id/withdraw', auth, wdLimit, async (req, res) => {
   }
   if (t.status !== 'success') {                                // Flutterwave refused it: the money never left, so put it back
     await Plan.updateOne({ _id: plan._id }, { $inc: { balance: amount } });
+    await Referral.updateMany({ withdrawTx: ref }, { $unset: { withdrawnAt: 1, withdrawTx: 1 } });
     await Tx.updateOne({ _id: tx._id }, { status: 'failed' });
     return res.status(502).json({ error: 'Payout failed. Your money is safe. Try again.' });
   }
@@ -362,7 +380,7 @@ app.post('/api/plans/:id/withdraw', auth, wdLimit, async (req, res) => {
 });
 
 // ---------- PAYMENT PROCESSING (shared by the webhook and the re-check job) ----------
-// tx_ref = plan_<planId>_<random> | auto_ | member_ | wallet_
+// tx_ref = plan_<planId>_<random> | auto_ | member_
 // Every step below is safe to run twice for the same payment, so a retry after a failure can never double-credit.
 const PendingPay = mongoose.model('PendingPay', new mongoose.Schema({
   txRef: { type: String, unique: true }, kind: String, user: mongoose.Schema.Types.ObjectId, amount: Number,
@@ -389,7 +407,6 @@ async function processPayment(d) {
     settled = !!(t && t.status === 'successful' && t.currency === 'NGN' && t.tx_ref === ref && okId(ref.split('_')[1])) && await creditPlanDeposit(ref.split('_')[1], t);
   } else if (/^auto_/.test(ref)) settled = await activateAutoSave(d);
   else if (/^member_/.test(ref)) settled = await activateMembership(d);
-  else if (/^wallet_/.test(ref)) settled = await creditWalletFund(d);
   else return false;
   if (settled) await PendingPay.updateOne({ txRef: ref }, { status: 'done' });
   return settled;
@@ -405,6 +422,7 @@ async function settleTransfer(d) {
   const tx = await Tx.findOneAndUpdate(open, { status: 'failed' });          // only the first FAILED message gets through
   if (!tx) return;
   const p = await Plan.findOneAndUpdate({ _id: tx.plan }, { $inc: { balance: tx.amount } }, { new: true });
+  await Referral.updateMany({ withdrawTx: ref }, { $unset: { withdrawnAt: 1, withdrawTx: 1 } });
   await Ledger.create({ user: tx.user, kind: 'reversal', amount: tx.amount, balanceAfter: p?.balance, plan: tx.plan, ref: `rev_${ref}`, meta: { reason: 'payout failed' } }).catch(() => {});
   await Notif.create({ user: tx.user, title: 'Withdrawal failed', body: `Your withdrawal of ${ngn(tx.amount)} did not go through. The money is back in your plan.` });
 }
@@ -495,7 +513,7 @@ FACTS YOU CAN USE:
 - There is no transfer feature. Money leaves only by Withdraw, to a bank account in the member's own name. If the bank name does not match the CSave name, it is blocked. Withdrawals always need the 4-digit PIN (set in Profile). If fingerprint is on, the phone asks for it as well. Five wrong PINs lock withdrawals for 30 minutes.
 - Membership: a one-time compulsory fee of ₦5,000. Terms and conditions apply. There is no refund feature in the app: never promise a refund, and start your reply with ESCALATE if a member asks for one. Pay from Profile > Membership. After payment the membership ID appears in notifications and is emailed with the cooperative bylaws.
 - KYC: Profile > KYC. Needs phone, date of birth, address, ID type and number, next of kin, and four photos taken with the camera: a selfie holding a paper with your full name, the front and back of your ID, and your chosen bill (for example the NEPA bill). Staff review it and the member gets a notification.
-- Referral code: appears on Home only after KYC is approved and the membership fee is paid. When a friend the member referred pays their membership fee, the reward the cooperative has set is paid into the referrer's wallet, once. Quote an amount only if it is in the data you are given; otherwise say the current reward is shown in the app. Never promise a payout date or a reward for anything other than a paid membership.
+- Referral code: appears on Home only after KYC is approved and the membership fee is paid. A referral is credited to the referrer's active savings plan once the friend has finished KYC, paid the membership fee and made a first deposit. Until then it is shown as waiting. Quote an amount only if it is in the data you are given; otherwise say the current reward is shown in the app. Never promise a payout date or a reward for anything other than a paid membership.
 - Fingerprint: Profile > Fingerprint switch. The phone checks the fingerprint. The app locks itself when the member leaves it.
 - Forgot password: tap Forgot password on the sign-in screen. A 6-digit code is emailed and works for 10 minutes.
 - Budget tool: Budget tab (income, savings first, categories, expenses, goals, calendar alarms, weekly checklist, rules, history). Insights tab is the AI money coach.
@@ -629,66 +647,99 @@ const Counter = mongoose.model('Counter', new mongoose.Schema({ _id: String, n: 
 const nextMemberNo = async () => (await Counter.findOneAndUpdate({ _id: 'member' }, { $inc: { n: 1 } }, { upsert: true, new: true })).n;
 
 // ---------- REFERRAL REWARDS ----------
-// One Referral record per referred person, unique on the referee. It is written before any money moves; the wallet
-// credit is keyed on the referee, so a webhook retry can never pay the same referral twice.
+// A Referral record is written as soon as the referred person pays the membership fee (recorded immediately).
+// It is CREDITED into one of the referrer's savings plans only when all of this is true:
+//   1. the referred person's KYC is approved, 2. they have paid the membership fee,
+//   3. they have started saving (a first deposit), 4. the referrer is in good standing,
+//   5. the referrer has an ACTIVE savings plan to put it in (the oldest active one).
+// Until then it stays "pending", with the reason, and its value follows the current rule.
+// Once credited, the amount is frozen and stays in that plan. It leaves only when that plan is withdrawn,
+// and then it is marked as withdrawn with the date and the withdrawal reference.
 const Referral = mongoose.model('Referral', new mongoose.Schema({
   referee: { type: mongoose.Schema.Types.ObjectId, ref: 'User', unique: true },
   referrer: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
   status: { type: String, enum: ['pending', 'paid', 'skipped'], index: true },
-  amount: { type: Number, default: 0 }, rule: Object, reason: String, paidAt: Date,
+  amount: { type: Number, default: 0 }, plan: { type: mongoose.Schema.Types.ObjectId, index: true },
+  rule: Object, reason: String, paidAt: Date, withdrawnAt: Date, withdrawTx: String,
 }, { timestamps: true }));
 
-async function payReferralReward(referee) {
-  if (!referee.referredBy) return;
+async function currentRule() {
+  const cfg = await Config.findById('referral');
+  try { return normaliseRule(cfg?.referral || { type: 'off', value: 0 }); } catch { return { type: 'off', value: 0 }; }
+}
+const rewardNow = rule => (rule && rule.type !== 'off' ? rewardFor(rule, MEMBERSHIP_FEE) : 0);
+const ruleText = rule => rule.type === 'percent' ? `${rule.value}% of the ₦5,000 membership fee for each person you refer who qualifies`
+  : rule.type === 'amount' ? `₦${Number(rule.value).toLocaleString('en-US')} for each person you refer who qualifies`
+  : 'Referral rewards are switched off right now.';
+const shortName = n => { const p = String(n || '').trim().split(/\s+/); return p.length > 1 ? `${p[0]} ${p[p.length - 1][0]}.` : (p[0] || 'Member'); };
+
+// A savings plan is ACTIVE when it is not paused and still running: a C Plan before its unlock date, a Mission Plan below its target.
+const planIsActive = p => !p.paused && (p.type === 'C_PLAN' ? new Date() < new Date(p.unlockDate) : (p.balance || 0) < (p.targetAmount || Infinity));
+
+/** Totals for one referrer, from their referral records. earned = credited ever; balance = credited and not yet withdrawn. */
+function referralTotals(rows, rv) {
+  const paid = rows.filter(r => r.status === 'paid');
+  const pending = rows.filter(r => r.status === 'pending');
+  const earned = paid.reduce((s, r) => s + (r.amount || 0), 0);
+  const withdrawn = paid.filter(r => r.withdrawnAt).reduce((s, r) => s + (r.amount || 0), 0);
+  return { referred: rows.length, credited: paid.length, waiting: pending.length, earned, withdrawn, balance: earned - withdrawn, waitingValue: pending.length * (rv || 0) };
+}
+
+/** Records the referral if needed and credits it when every condition holds. Safe to call any number of times. */
+async function qualifyReferral(refereeId) {
+  const referee = await User.findById(refereeId).select('_id referredBy membershipPaid kycStatus');
+  if (!referee || !referee.referredBy) return;
   let rec = await Referral.findOne({ referee: referee._id });
   if (!rec) {
-    // The rule and the amount are fixed when the referral is first seen, so a later rule change cannot alter it midway.
-    const cfg = await Config.findById('referral');
-    let rule = { type: 'off', value: 0 };
-    try { rule = normaliseRule(cfg?.referral || { type: 'off', value: 0 }); } catch { /* keep off */ }
-    const amount = rewardFor(rule, MEMBERSHIP_FEE);
-    try { rec = await Referral.create({ referee: referee._id, referrer: referee.referredBy, status: 'pending', amount, rule, reason: amount > 0 ? '' : 'Referral rewards are off.' }); }
+    try { rec = await Referral.create({ referee: referee._id, referrer: referee.referredBy, status: 'pending', reason: 'Waiting for the person you referred to finish KYC, pay the fee and start saving.' }); }
     catch (e) { if (e.code !== 11000) throw e; rec = await Referral.findOne({ referee: referee._id }); }
   }
-  await settleReferral(rec);
+  await settleReferral(rec, referee);
 }
 
-/** Pays one referral if it may be paid now. A referral the referrer is not yet eligible for is HELD (stays pending,
- *  with the reason) and paid by settlePendingReferrals once they qualify. Switched-off rewards and self-referrals are skipped for good. */
-async function settleReferral(rec) {
+async function settleReferral(rec, referee) {
   if (!rec || rec.status !== 'pending') return;
-  if (!(rec.amount > 0)) { rec.status = 'skipped'; await rec.save(); return; }
+  const setReason = async why => { if (rec.reason !== why) { rec.reason = why; await rec.save(); } };
   if (String(rec.referrer) === String(rec.referee)) { rec.status = 'skipped'; rec.reason = 'Self-referral is not paid.'; await rec.save(); return; }
+  if (!referee) referee = await User.findById(rec.referee).select('_id referredBy membershipPaid kycStatus');
+  if (!referee) return;
+  const rule = await currentRule();
+  const amount = rewardNow(rule);
+  if (!(amount > 0)) return setReason('Waiting: referral rewards are switched off right now.');
+  if (!(referee.kycStatus === 'approved' && referee.membershipPaid)) return setReason('Waiting for the person you referred to finish KYC and pay the fee.');
+  if (!(await Tx.exists({ user: referee._id, kind: 'deposit', status: 'ok' }))) return setReason('Waiting for the person you referred to start saving.');
   const referrer = await User.findById(rec.referrer).select('name role membershipPaid kycStatus active fraudFlag');
-  const referee = await User.findById(rec.referee).select('_id fraudFlag');
-  const blocked = rewardBlocker(referrer, referee || { _id: rec.referee });
-  if (blocked) { if (rec.reason !== blocked) { rec.reason = blocked; await rec.save(); } return; }
+  const blocked = rewardBlocker(referrer, referee);
+  if (blocked) return setReason(blocked);
+  const plans = await Plan.find({ user: rec.referrer }).sort('createdAt');
+  const target = plans.find(planIsActive);
+  if (!target) return setReason('Waiting: you have no active savings plan. Open one, or reopen a paused one, and this will be added to it.');
   const key = `ref_${rec.referee}`;
-  const r = await creditWalletOnce(Wallet, rec.referrer, rec.amount, key);       // once per referee, even on retries
-  if (!r.duplicate) {
-    await Ledger.create({ user: rec.referrer, kind: 'referral_reward', amount: rec.amount, balanceAfter: r.wallet.balance, wallet: r.wallet._id, ref: key });
-    await Notif.create({ user: rec.referrer, title: 'Referral reward', body: `A friend you referred has paid their membership. ₦${rec.amount.toLocaleString('en-US')} was added to your wallet.` });
-    await Audit.create({ role: 'system', action: 'REFERRAL_PAID', detail: { referee: String(rec.referee), referrer: String(rec.referrer), amount: rec.amount } }).catch(() => {});
+  // Credited into that plan once. A retry finds the key already there and does not add it again.
+  const got = await Plan.findOneAndUpdate({ _id: target._id, processed: { $ne: key } }, { $inc: { balance: amount }, $push: { processed: key } }, { new: true });
+  if (got) {
+    await Ledger.create({ user: rec.referrer, kind: 'referral_reward', amount, balanceAfter: got.balance, plan: target._id, ref: key });
+    await Notif.create({ user: rec.referrer, title: 'Referral reward', body: `A person you referred has finished KYC, paid the membership fee and started saving. ₦${amount.toLocaleString('en-US')} was added to your ${got.title || 'savings plan'}.` });
+    await Audit.create({ role: 'system', action: 'REFERRAL_PAID', detail: { referee: String(rec.referee), referrer: String(rec.referrer), amount, plan: String(target._id) } }).catch(() => {});
   }
-  rec.status = 'paid'; rec.paidAt = new Date(); rec.reason = ''; await rec.save();
+  rec.status = 'paid'; rec.amount = amount; rec.plan = target._id; rec.rule = rule; rec.paidAt = new Date(); rec.reason = ''; await rec.save();
 }
 
-/** Pays held referrals whose referrer has since become eligible. Runs daily. Returns how many were checked and paid. */
+/** Re-checks every pending referral. Runs daily, and whenever a rule or a plan changes. */
 async function settlePendingReferrals() {
-  const due = await Referral.find({ status: 'pending', amount: { $gt: 0 } }).limit(500);
+  const due = await Referral.find({ status: 'pending' }).limit(1000);
   let paid = 0;
   for (const rec of due) {
-    try { await settleReferral(rec); if (rec.status === 'paid') paid++; }
+    try { await qualifyReferral(rec.referee); const now = await Referral.findById(rec._id).select('status'); if (now?.status === 'paid') paid++; }
     catch (e) { console.error('referral', String(rec._id), e.message); }
   }
   return { checked: due.length, paid };
 }
 
 async function currentReferralRewardText() {
-  const cfg = await Config.findById('referral');
-  let rule; try { rule = normaliseRule(cfg?.referral || { type: 'off', value: 0 }); } catch { return null; }
+  const rule = await currentRule();
   if (rule.type === 'off') return null;
-  return `₦${rewardFor(rule, MEMBERSHIP_FEE).toLocaleString('en-US')} when a friend you refer pays their membership fee`;
+  return `₦${rewardNow(rule).toLocaleString('en-US')} for each person you refer, once they finish KYC, pay the fee and start saving`;
 }
 
 async function makeReferral(u) {
@@ -711,12 +762,14 @@ async function sendMembershipEmail(u) {
 }
 
 async function extraMembershipPayment(uid, t, flwId) {     // safe to run twice for the same payment
-  const r = await creditWalletOnce(Wallet, uid, t.amount, 'flw_' + flwId);
-  await upsertOnce(Tx, { flwId }, { flwId, user: uid, kind: 'wallet_fund', amount: t.amount, status: 'ok' });
-  await upsertOnce(Ledger, { flwId }, { user: uid, kind: 'wallet_fund', amount: t.amount, balanceAfter: r.wallet?.balance, wallet: r.wallet?._id, ref: t.tx_ref, meta: { note: 'second membership payment' } });
-  if (!r.duplicate) {
-    await Notif.create({ user: uid, title: 'Extra payment kept in your wallet', body: `Your membership was already active, so the extra ${ngn(t.amount)} was added to your wallet. You can move it into a plan any time.` });
+  // The member already has a membership, so this second payment is not income and is not saved into a plan. It is recorded and staff refund it.
+  const seen = await Tx.exists({ flwId });
+  await upsertOnce(Tx, { flwId }, { flwId, user: uid, kind: 'extra_payment', amount: t.amount, status: 'review' });
+  await upsertOnce(Ledger, { flwId }, { user: uid, kind: 'extra_payment', amount: t.amount, ref: t.tx_ref, meta: { note: 'second membership payment, to be refunded' } });
+  if (!seen) {
+    await Notif.create({ user: uid, title: 'Extra payment received', body: `Your membership was already active, so your extra payment of ${ngn(t.amount)} was not used. Our team will refund it to you.` });
     await Audit.create({ role: 'system', action: 'MEMBERSHIP_EXTRA_PAYMENT', detail: { user: String(uid), amount: t.amount, flwId } }).catch(() => {});
+    alertOps('Refund an extra membership payment', `Member ${uid} paid the membership fee twice (${ngn(t.amount)}, Flutterwave payment ${flwId}). Refund the second payment in Flutterwave.`, 'extra_' + flwId);
   }
   return true;
 }
@@ -729,7 +782,7 @@ async function activateMembership(d) {
   const flwId = String(t.id);
   // Claim the "paid" flag atomically (and remember WHICH payment claimed it). If we stop after this, a retry finishes the job.
   if (!u.membershipPaid) u = (await User.findOneAndUpdate({ _id: uid, membershipPaid: { $ne: true } }, { membershipPaid: true, membershipPaidAt: new Date(), membershipFlwId: flwId }, { new: true })) || await User.findById(uid);
-  // Membership was already paid by a DIFFERENT payment: this one is a second ₦5,000. It is not membership income, so it goes to the member's wallet.
+  // Membership was already paid by a DIFFERENT payment: this one is a second ₦5,000. It is not membership income, so it is recorded for a refund.
   const mine = u.membershipFlwId === flwId || !!(await Tx.exists({ flwId, kind: 'membership' }));
   if (u.membershipPaid && !mine) return extraMembershipPayment(uid, t, flwId);
   await upsertOnce(Tx, { flwId }, { flwId, user: uid, kind: 'membership', amount: t.amount, status: 'ok' });
@@ -743,7 +796,7 @@ async function activateMembership(d) {
       await Audit.create({ role: 'system', action: 'MEMBERSHIP_PAID', detail: { user: uid, membershipId: got.membershipId } });
     }
   }
-  if (u.membershipPaid) await payReferralReward(u);          // retried safely: the referral is paid at most once
+  if (u.membershipPaid) await qualifyReferral(u._id).catch(e => console.error('referral', e.message));   // records it; credits it once the friend qualifies
   return true;
 }
 
@@ -766,6 +819,7 @@ app.post('/api/kyc', auth, async (req, res) => {
   const { phone, dob, idType, idNumber, nextOfKin, gender, maritalStatus, occupation, placeOfOrigin, proofOfAddress } = req.body;
   const address = String(req.body.residentialAddress || req.body.address || '');
   if (![phone, address, dob, idType, idNumber, nextOfKin, gender, maritalStatus, occupation, placeOfOrigin, proofOfAddress].every(x => x && String(x).trim())) return res.status(400).json({ error: 'Fill in every field.' });
+  if (req.body.limitAck !== true) return res.status(400).json({ error: `Please tick the box to confirm you have read the ${ngn(capFor())} savings limit.` });
   if (!['Male', 'Female'].includes(gender)) return res.status(400).json({ error: 'Pick male or female.' });
   if (!['Single', 'Married', 'Divorced', 'Widowed'].includes(maritalStatus)) return res.status(400).json({ error: 'Pick your marital status.' });
   if (!ID_TYPES.includes(idType)) return res.status(400).json({ error: 'Pick an ID type from the list.' });
@@ -789,12 +843,19 @@ app.post('/api/kyc', auth, async (req, res) => {
   const idHash = crypto.createHmac('sha256', kycKey()).update(idNo.toUpperCase()).digest('hex');
   if (await User.exists({ _id: { $ne: u._id }, 'kyc.idHash': idHash }))
     return res.status(409).json({ error: 'This ID number is already registered to another CSave account. Contact customer service if you think this is a mistake.' });
+  // Automatic ID check (Dojah). Off until the keys are set. It never approves anyone: staff still decide, and see the result.
+  const chk = await runIdCheck({ idType, idNo, accountName: u.name, dob });
+  if (process.env.DOJAH_BLOCK_MISMATCH === '1') {          // optional: tell the member at once instead of leaving it to staff
+    if (chk.result === 'notfound') return res.status(422).json({ error: 'We could not find that NIN. Check the number and try again.' });
+    if (chk.result === 'mismatch') return res.status(422).json({ error: chk.reason === 'dob' ? 'The date of birth does not match your NIN record. Check it and try again.' : 'The name on your CSave account does not match your NIN record. Check your full name. If it is correct, contact customer service.' });
+  }
   // Photos are replaced on every submission. Each one is stored encrypted and tagged with its real image type.
   await KycPhoto.deleteMany({ user: u._id });
   await KycPhoto.insertMany(PHOTO_SLOTS.map(slot => ({ user: u._id, slot, mime: sniff(decoded[slot]), enc: aesEnc(kycKey(), decoded[slot].toString('base64')) })));
   u.kyc = { phone, address, dob, idType, idLast4: idNo.slice(-4), idNumberEnc: aesEnc(kycKey(), idNo), idHash, nextOfKin, submittedAt: new Date(),
-    gender, maritalStatus, occupation: String(occupation).trim(), placeOfOrigin: String(placeOfOrigin).trim(), proofOfAddress: String(proofOfAddress).trim() };
-  u.kycApprovals = []; u.kycStatus = 'pending'; await u.save();           // a new submission starts the approvals again
+    gender, maritalStatus, occupation: String(occupation).trim(), placeOfOrigin: String(placeOfOrigin).trim(), proofOfAddress: String(proofOfAddress).trim(),
+    idCheck: chk.result, idCheckReason: chk.reason, idCheckedAt: ['match', 'mismatch', 'notfound'].includes(chk.result) ? new Date() : undefined };
+  u.kycApprovals = []; u.kycStatus = 'pending'; u.limitAckAt = new Date(); await u.save();           // a new submission starts the approvals again
   log(req, 'KYC_SUBMITTED'); res.json({ ok: true });
 });
 
@@ -813,6 +874,91 @@ app.post('/api/membership/pay', auth, async (req, res) => {
   if (!r?.data?.link) return res.status(502).json({ error: 'Could not start payment. Try again.' });
   await trackPayment(memRef, 'membership', u._id, 5000, r.data.link);   // so the 10-minute re-check job can recover it if the webhook is lost
   log(req, 'MEMBERSHIP_PAY_STARTED'); res.json({ link: r.data.link });
+});
+
+// ---------- MY DETAILS + PROFILE PICTURE ----------
+// A member can see what CSave holds about them. The full ID number and the KYC photos are never sent to the phone.
+const ProfilePhoto = mongoose.model('ProfilePhoto', new mongoose.Schema({ user: { type: mongoose.Schema.Types.ObjectId, unique: true }, mime: String, data: Buffer }, { timestamps: true }));
+const photoLimit = mkLimit(20, 60 * 60 * 1000, req => 'u' + req.user?.id);
+app.get('/api/me/details', auth, async (req, res) => {
+  const u = await User.findById(req.user.id);
+  if (!u) return res.status(404).json({ error: 'Account not found.' });
+  const [slots, photo] = await Promise.all([KycPhoto.find({ user: u._id }).select('slot'), ProfilePhoto.exists({ user: u._id })]);
+  res.set('Cache-Control', 'no-store');
+  res.json(memberDetails(u, slots.map(x => x.slot), !!photo));
+});
+// The member confirms with their password to see the hidden rows (phone, address, birth date, next of kin, ID digits). Logged, and rate limited.
+app.post('/api/me/details/reveal', auth, pwLimit, async (req, res) => {
+  const u = await User.findById(req.user.id);
+  if (!u) return res.status(404).json({ error: 'Account not found.' });
+  if (!(await bcrypt.compare(String(req.body.password || ''), u.passwordHash || ''))) return res.status(400).json({ error: 'That password is not right.' });
+  const [slots, photo] = await Promise.all([KycPhoto.find({ user: u._id }).select('slot'), ProfilePhoto.exists({ user: u._id })]);
+  log(req, 'DETAILS_REVEALED'); res.set('Cache-Control', 'no-store');
+  res.json(memberDetails(u, slots.map(x => x.slot), !!photo, true));
+});
+app.get('/api/me/photo', auth, async (req, res) => {
+  const p = await ProfilePhoto.findOne({ user: req.user.id });
+  res.set('Cache-Control', 'no-store');
+  res.json({ photo: p ? `data:${p.mime};base64,${Buffer.from(p.data).toString('base64')}` : null });
+});
+app.post('/api/me/photo', auth, photoLimit, async (req, res) => {
+  const r = parseProfilePhoto(req.body.photo, sniff);
+  if (r.error) return res.status(400).json({ error: r.error });
+  await ProfilePhoto.findOneAndUpdate({ user: req.user.id }, { mime: r.mime, data: r.buf }, { upsert: true, setDefaultsOnInsert: true });
+  log(req, 'PROFILE_PHOTO_SET'); res.json({ ok: true });
+});
+app.delete('/api/me/photo', auth, async (req, res) => {
+  await ProfilePhoto.deleteOne({ user: req.user.id });
+  log(req, 'PROFILE_PHOTO_REMOVED'); res.json({ ok: true });
+});
+
+// ---------- ACCOUNT DELETION (Google Play: in-app option AND a public web page) ----------
+// Personal details are erased and the account is closed. Payment records stay, without a name, because financial rules require them.
+// Blocked while money is still held or a payment is unfinished, so money can never vanish with an account.
+async function closeMemberAccount(u, req, via) {
+  const [plans, openPayouts, openPayments] = await Promise.all([
+    Plan.find({ user: u._id }).select('balance'),
+    Tx.countDocuments({ user: u._id, kind: 'withdraw', status: { $in: ['processing', 'pending', 'review'] } }),
+    PendingPay.countDocuments({ user: u._id, status: 'pending', createdAt: { $gte: new Date(Date.now() - 2 * 3600000) } }),
+  ]);
+  const why = deletionBlocker({ planBalance: plans.reduce((t, x) => t + (x.balance || 0), 0), openPayouts, openPayments });
+  if (why) return { ok: false, error: why };
+  const oldEmail = u.email, firstName = String(u.name || 'there').split(' ')[0];
+  // Close the account FIRST, so a failure half-way never leaves a usable account behind.
+  await User.updateOne({ _id: u._id }, erasedUser(u._id, await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10)));
+  const cleanup = await Promise.allSettled([KycPhoto, ProfilePhoto, Notif, Budget, Expense, Reminder, Reflection, Checkin, Rule, Goal, Task, CoachMsg, Ticket, AutoSave].map(M => M.deleteMany({ user: u._id })));
+  const failed = cleanup.filter(r => r.status === 'rejected').length;
+  if (failed) console.error('Account deletion cleanup failed for', String(u._id), cleanup.filter(r => r.status === 'rejected').map(r => r.reason?.message));
+  Audit.create({ actor: u._id, role: 'customer', action: 'ACCOUNT_DELETED', detail: { via, cleanupFailed: failed }, ip: req.ip }).catch(() => {});
+  Promise.resolve(sendEmail(oldEmail, 'Your CSave account was deleted', mail('Account deleted',
+    `<p>Hi <b>${hescape(firstName)}</b>, your CSave account has been deleted and your personal details were erased.</p>
+     <p style="color:#8a8580">If you did not do this, contact CSave customer service straight away.</p>`))).catch(() => {});
+  return { ok: true };
+}
+
+// From the Profile screen in the app.
+app.post('/api/me/delete-account', auth, pwLimit, async (req, res) => {
+  const u = await User.findById(req.user.id);
+  if (!u || u.role !== 'customer') return res.status(403).json({ error: 'Staff accounts are closed by an administrator.' });
+  if (!(await bcrypt.compare(String(req.body.password || ''), u.passwordHash || ''))) return res.status(400).json({ error: 'That password is not right.' });
+  const r = await closeMemberAccount(u, req, 'app');
+  if (!r.ok) return res.status(409).json({ error: r.error });
+  res.json({ ok: true });
+});
+
+// From the public web page (the link given to Google Play).
+const deleteWebLimit = mkLimit(6, 15 * 60 * 1000, byEmail);
+app.get(['/delete-account', '/account-deletion'], (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(deletePageHtml({ support: process.env.SUPPORT_EMAIL || '' })); });
+app.post('/api/account/delete', deleteWebLimit, async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const u = email ? await User.findOne({ email }) : null;
+  if (!u || u.active === false || !u.passwordHash || !(await bcrypt.compare(String(req.body.password || ''), u.passwordHash)))
+    return res.status(400).json({ error: 'Wrong email or password.' });
+  if (u.role !== 'customer') return res.status(403).json({ error: 'This is a staff account. Ask an administrator to close it.' });
+  if (u.fraudFlag) return res.status(403).json({ error: 'This account is locked for review. Contact support.' });
+  const r = await closeMemberAccount(u, req, 'web');
+  if (!r.ok) return res.status(409).json({ error: r.error });
+  res.json({ ok: true });
 });
 
 // ---------- PASSWORD RESET (6-digit code, 10 minutes) ----------
@@ -845,8 +991,30 @@ app.post('/api/auth/reset', resetLimit, async (req, res) => {
 const staff = [auth, requireRole('admin', 'operations', 'finance')];
 app.get('/api/admin/members', ...staff, async (req, res) => {
   const rows = await User.find({ role: 'customer' })
-    .select('name email kycStatus kycApprovals kyc.phone kyc.idType kyc.idLast4 membershipPaid membershipPaidAt membershipId membershipEmailSent createdAt').sort('-createdAt').limit(300);
-  res.json(rows.map(x => { const o = x.toObject(); const approvals = (o.kycApprovals || []).length; delete o.kycApprovals; return { ...o, approvals, approvalsNeeded: KYC_NEEDED() }; }));
+    .select('name email active deactivatedAt deactivatedReason kycStatus kycApprovals kyc.phone kyc.idType kyc.idLast4 membershipPaid membershipPaidAt membershipId membershipEmailSent createdAt').sort('-createdAt').limit(300);
+  const all = await Referral.find({ referrer: { $in: rows.map(r => r._id) } }).lean();
+  const rv = rewardNow(await currentRule());
+  const byRef = {}; for (const r of all) { const k = String(r.referrer); (byRef[k] = byRef[k] || []).push(r); }
+  res.json(rows.map(x => { const o = x.toObject(); const approvals = (o.kycApprovals || []).length; delete o.kycApprovals; return { ...o, approvals, approvalsNeeded: KYC_NEEDED(), referrals: referralTotals(byRef[String(x._id)] || [], rv) }; }));
+});
+
+// Admin can deactivate a member for misconduct. A deactivated member cannot sign in and every request is refused at once
+// (auth() checks active). Their money is NOT moved or deleted: balances stay as they are. Auto-saves are paused.
+// Reactivating does not restart auto-saves; the member turns them back on in the app. Deleted accounts cannot be reopened.
+app.post('/api/admin/members/:id/active', ...only(), async (req, res) => {
+  if (!okId(req.params.id)) return res.status(400).json({ error: 'Unknown member.' });
+  const active = !!req.body.active;
+  const reason = String(req.body.reason || '').trim().slice(0, 300);
+  if (!active && reason.length < 5) return res.status(400).json({ error: 'Give a reason of at least 5 characters.' });
+  const u = await User.findOne({ _id: req.params.id, role: 'customer', deletedAt: { $in: [null] } }).select('_id');
+  if (!u) return res.status(404).json({ error: 'Member not found, or the member closed this account.' });
+  if (active) await User.updateOne({ _id: u._id }, { $set: { active: true }, $unset: { deactivatedAt: 1, deactivatedReason: 1 } });
+  else {
+    await User.updateOne({ _id: u._id }, { $set: { active: false, deactivatedAt: new Date(), deactivatedReason: reason }, $inc: { tokenVersion: 1 } });
+    await AutoSave.updateMany({ user: u._id, status: 'active' }, { $set: { status: 'paused' } });
+  }
+  log(req, active ? 'MEMBER_REACTIVATED' : 'MEMBER_DEACTIVATED', { member: String(u._id), reason });
+  res.json({ ok: true });
 });
 
 // Staff see what the member submitted, including the real ID number. Every view is written to the audit log.
@@ -857,7 +1025,7 @@ app.get('/api/admin/kyc/:id', auth, requireRole('admin', 'operations'), async (r
   log(req, 'KYC_VIEWED', { member: u._id });
   const photos = (await KycPhoto.find({ user: u._id }).select('slot').lean()).map(p => p.slot);
   res.json({ photos, name: u.name, status: u.kycStatus, phone: u.kyc?.phone, address: u.kyc?.address, dob: u.kyc?.dob, gender: u.kyc?.gender, maritalStatus: u.kyc?.maritalStatus, occupation: u.kyc?.occupation, placeOfOrigin: u.kyc?.placeOfOrigin, proofOfAddress: u.kyc?.proofOfAddress, idType: u.kyc?.idType, idNumber, idLast4: u.kyc?.idLast4,
-    nextOfKin: u.kyc?.nextOfKin, submittedAt: u.kyc?.submittedAt, bvnCheck: u.kyc?.bvnCheck, bvnCheckedAt: u.kyc?.bvnCheckedAt, approvals: (u.kycApprovals || []).length, approvalsNeeded: KYC_NEEDED() });
+    nextOfKin: u.kyc?.nextOfKin, submittedAt: u.kyc?.submittedAt, idCheck: u.kyc?.idCheck, idCheckReason: u.kyc?.idCheckReason, idCheckedAt: u.kyc?.idCheckedAt, approvals: (u.kycApprovals || []).length, approvalsNeeded: KYC_NEEDED() });
 });
 
 // One KYC photo, for staff only. Every view is written to the audit log.
@@ -899,6 +1067,7 @@ app.post('/api/admin/kyc/:id', auth, requireRole('admin', 'operations'), async (
   if (have < need) { log(req, 'KYC_APPROVAL_GIVEN', { member: u._id, have, need }); return res.json({ ok: true, status: 'pending', approvals: have, approvalsNeeded: need }); }
   const done = await User.findOneAndUpdate({ _id: id, kycStatus: 'pending' }, { kycStatus: 'approved' });
   if (done) await Notif.create({ user: u._id, title: 'KYC approved', body: 'Your KYC is approved.' });
+  if (done) await qualifyReferral(u._id).catch(e => console.error('referral', e.message));
   log(req, 'KYC_APPROVED', { member: u._id }); res.json({ ok: true, status: 'approved' });
 });
 
@@ -1136,7 +1305,7 @@ async function computeScore(userId) {
   const days = new Set([...ex.map(e => lagos(e.date).date), ...ck.map(c => c.date)]);
   const consistency = Math.round(30 * Math.min(1, days.size / Math.max(1, t.day)));
   const plans = await Plan.find({ user: userId }).select('_id');
-  const dep = plans.length ? await Tx.countDocuments({ plan: { $in: plans.map(p => p._id) }, kind: { $in: ['deposit', 'wallet_to_plan'] }, createdAt: { $gte: start } }) : 0;
+  const dep = plans.length ? await Tx.countDocuments({ plan: { $in: plans.map(p => p._id) }, kind: 'deposit', createdAt: { $gte: start } }) : 0;
   const savings = dep > 0 ? 20 : plans.length ? 10 : 0;
   const refl = Math.min(10, Math.round(10 * (await Reflection.countDocuments({ user: userId, createdAt: { $gte: start } })) / 4));
   const total = adherence + consistency + savings + refl;
@@ -1243,7 +1412,7 @@ async function accountAnalysis(userId) {
   const txs = plans.length ? await Tx.find({ plan: { $in: plans.map(p => p._id) }, createdAt: { $gte: since } }) : [];
   const contributionsByMonth = {};
   txs.forEach(t => { const m = lagos(t.createdAt).ym, o = contributionsByMonth[m] ||= { deposits: 0, withdrawals: 0, count: 0 };
-    if (t.kind === 'deposit' || t.kind === 'wallet_to_plan') o.deposits += t.amount; if (t.kind === 'withdraw') o.withdrawals += t.amount; o.count++; });
+    if (t.kind === 'deposit') o.deposits += t.amount; if (t.kind === 'withdraw') o.withdrawals += t.amount; o.count++; });
   let recentPeriods = [], topSpendingCategories90d = [];
   if (b) {
     const ex = await Expense.find({ user: userId }).sort('date').lean();
@@ -1450,21 +1619,21 @@ const FIN = only('finance');
 const dayRange = q => { const f = q.from ? new Date(q.from + 'T00:00:00+01:00') : new Date(Date.now() - 30 * 86400000), t = q.to ? new Date(q.to + 'T23:59:59+01:00') : new Date(); return { $gte: f, $lte: t }; };
 app.get('/api/finance/summary', ...FIN, async (req, res) => {
   const rows = await Tx.aggregate([{ $match: { createdAt: dayRange(req.query), status: { $ne: 'failed' } } }, { $group: { _id: '$kind', total: { $sum: '$amount' }, count: { $sum: 1 } } }]);
-  const out = { deposit: { total: 0, count: 0 }, wallet_fund: { total: 0, count: 0 }, withdraw: { total: 0, count: 0 }, membership: { total: 0, count: 0 } };
+  const out = { deposit: { total: 0, count: 0 }, withdraw: { total: 0, count: 0 }, membership: { total: 0, count: 0 } };
   rows.forEach(r => { if (out[r._id]) out[r._id] = { total: r.total, count: r.count }; });
   const balances = await Plan.aggregate([{ $group: { _id: '$type', total: { $sum: '$balance' }, accounts: { $sum: 1 } } }]);
-  const [w] = await Wallet.aggregate([{ $group: { _id: null, total: { $sum: '$balance' }, accounts: { $sum: 1 } } }]);
-  const walletTotal = w?.total || 0, planTotal = balances.reduce((x, b) => x + b.total, 0);
-  // memberBalances now ALSO lists wallets, and totalHeld is the full amount owed to members
+  const planTotal = balances.reduce((x, b) => x + b.total, 0);   // totalHeld is the full amount owed to members
   // Money the cooperative pays out by rule (interest and referral rewards) is recorded in the ledger, not as transactions.
   const byKind = await Ledger.aggregate([{ $match: { kind: { $in: ['interest', 'referral_reward'] }, createdAt: dayRange(req.query) } }, { $group: { _id: '$kind', total: { $sum: '$amount' }, count: { $sum: 1 } } }]);
   const k = Object.fromEntries(byKind.map(r => [r._id, { total: r.total, count: r.count }]));
-  res.json({ ...out, interest: k.interest || { total: 0, count: 0 }, referralRewards: k.referral_reward || { total: 0, count: 0 },
-    memberBalances: [...balances, { _id: 'WALLET', total: walletTotal, accounts: w?.accounts || 0 }], totalHeld: planTotal + walletTotal,
-    net: out.deposit.total + out.wallet_fund.total + out.membership.total - out.withdraw.total });
+  const owedRows = await Referral.find({ status: 'paid', withdrawnAt: { $exists: false } }).select('amount').lean();
+  const referralOwed = owedRows.reduce((t, r) => t + (r.amount || 0), 0);   // credited referral money still inside member plans
+  res.json({ ...out, interest: k.interest || { total: 0, count: 0 }, referralRewards: k.referral_reward || { total: 0, count: 0 }, referralOwed,
+    memberBalances: balances, totalHeld: planTotal,
+    net: out.deposit.total + out.membership.total - out.withdraw.total });
 });
 app.get('/api/finance/transactions', ...FIN, async (req, res) => {
-  const q = { createdAt: dayRange(req.query) }; if (['deposit', 'wallet_fund', 'wallet_to_plan', 'withdraw', 'membership'].includes(req.query.kind)) q.kind = req.query.kind;
+  const q = { createdAt: dayRange(req.query) }; if (['deposit', 'withdraw', 'membership', 'extra_payment'].includes(req.query.kind)) q.kind = req.query.kind;
   const t = await Tx.find(q).sort('-createdAt').limit(500).populate('user', 'name');
   res.json(t.map(x => ({ id: x._id, at: x.createdAt, kind: x.kind, amount: x.amount, member: x.user?.name || '', ref: x.flwId || '', status: x.status })));
 });
@@ -1511,7 +1680,7 @@ app.get('/api/finance/trial-balance', ...FIN, async (req, res) => {
   const tb = Object.fromEntries(ACCOUNTS.map(a => [a, { debit: 0, credit: 0 }]));
   const post = (a, d, c) => { tb[a].debit += d; tb[a].credit += c; };
   (await Tx.aggregate([{ $match: { status: { $ne: 'failed' } } }, { $group: { _id: '$kind', total: { $sum: '$amount' } } }])).forEach(r => {   // member money moves post automatically (failed payouts are left out)
-    if (r._id === 'deposit' || r._id === 'wallet_fund') { post('Cash - Flutterwave', r.total, 0); post('Member savings (liability)', 0, r.total); }   // wallet_to_plan is an internal move: no entry
+    if (r._id === 'deposit') { post('Cash - Flutterwave', r.total, 0); post('Member savings (liability)', 0, r.total); }
     if (r._id === 'withdraw') { post('Member savings (liability)', r.total, 0); post('Cash - Flutterwave', 0, r.total); }
     if (r._id === 'membership') { post('Cash - Flutterwave', r.total, 0); post('Membership fees held (liability)', 0, r.total); }
   });
@@ -1542,9 +1711,13 @@ app.get('/api/ops/analytics', ...OPS, async (req, res) => {
   res.json({ total, kyc: Object.fromEntries(kyc.map(k => [k._id, k.n])), membershipPaid: paid, activeLast7Days: active7, budgetsCreated: budgets, plans, signupsByWeek: Object.entries(weeks).sort().map(([week, n]) => ({ week, n })) });
 });
 app.get('/api/ops/referrals', ...only('operations', 'finance'), async (req, res) => {
-  const refs = await User.aggregate([{ $match: { referredBy: { $ne: null } } }, { $group: { _id: '$referredBy', referred: { $sum: 1 }, paid: { $sum: { $cond: ['$membershipPaid', 1, 0] } } } }, { $sort: { referred: -1 } }, { $limit: 100 }]);
-  const names = Object.fromEntries((await User.find({ _id: { $in: refs.map(r => r._id) } }).select('name referralCode')).map(u => [String(u._id), u]));
-  res.json(refs.map(r => ({ member: names[String(r._id)]?.name || 'Unknown', code: names[String(r._id)]?.referralCode || '', referred: r.referred, referredPaid: r.paid })));
+  const all = await Referral.find().lean();
+  const rv = rewardNow(await currentRule());
+  const byRef = {}; for (const r of all) { const k = String(r.referrer); (byRef[k] = byRef[k] || []).push(r); }
+  const users = await User.find({ _id: { $in: Object.keys(byRef) } }).select('name referralCode');
+  res.json(users.map(u => { const t = referralTotals(byRef[String(u._id)] || [], rv);
+    return { member: u.name, code: u.referralCode || '', referred: t.referred, referredPaid: t.credited, earned: t.earned, balance: t.balance, waiting: t.waiting }; })
+    .sort((x, y) => y.referred - x.referred).slice(0, 100));
 });
 const Announcement = mongoose.model('Announcement', new mongoose.Schema({ title: String, body: String, images: [String], by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, sentTo: Number, sendAt: Date, sent: { type: Boolean, default: true } }, { timestamps: true }));
 // Sends an announcement to every active member now. Returns how many members received it.
@@ -1694,22 +1867,20 @@ async function creditPlanDeposit(planId, t) {            // safe to call twice f
   const key = 'flw_' + t.id, flwId = String(t.id);
   const pl = await Plan.findById(planId).select('user');
   if (!pl) { alertOps('Payment for a missing plan', `Payment ${flwId} is for a plan that does not exist (${planId}). A person must fix it by hand.`, 'noplan_' + flwId); return false; }
-  let where = 'plan', balanceAfter, walletId;
+  let balanceAfter;
   const updated = await creditPlanOnce(Plan, planId, t.amount, key);          // one atomic step: credit AND remember the payment id
   if (updated) balanceAfter = updated.balance;
   else {
     const done = await Plan.findOne({ _id: planId, processed: key }).select('balance');   // credited earlier (a retry)
     if (done) balanceAfter = done.balance;
-    else {                                                                    // the plan is paused: do not credit it. The member paid, so the money goes to their wallet
-      where = 'wallet';
-      const r = await creditWalletOnce(Wallet, pl.user, t.amount, key);
-      const w = r.wallet || await Wallet.findOne({ user: pl.user }).select('_id');
-      balanceAfter = r.wallet?.balance; walletId = w?._id;
-      if (!r.duplicate) await Notif.create({ user: pl.user, title: 'Payment kept in your wallet', body: `Your plan is paused, so ${ngn(t.amount)} was added to your wallet instead. Resume the plan and move it across any time.` });
+    else {                                                                    // the plan is paused. The member already paid into this plan, so it is still written into it.
+      const forced = await Plan.findOneAndUpdate({ _id: planId, processed: { $ne: key } }, { $inc: { balance: t.amount }, $push: { processed: key } }, { new: true });
+      balanceAfter = forced ? forced.balance : (await Plan.findById(planId).select('balance'))?.balance;
     }
   }
-  await upsertOnce(Tx, { flwId }, { flwId, plan: where === 'plan' ? planId : undefined, user: pl.user, kind: where === 'plan' ? 'deposit' : 'wallet_fund', amount: t.amount, status: 'ok' });
-  await upsertOnce(Ledger, { flwId }, { user: pl.user, kind: where === 'plan' ? 'plan_deposit' : 'wallet_fund', amount: t.amount, balanceAfter, plan: where === 'plan' ? planId : undefined, wallet: walletId, ref: t.tx_ref, meta: where === 'wallet' ? { note: 'plan paused' } : undefined });
+  await upsertOnce(Tx, { flwId }, { flwId, plan: planId, user: pl.user, kind: 'deposit', amount: t.amount, status: 'ok' });
+  await upsertOnce(Ledger, { flwId }, { user: pl.user, kind: 'plan_deposit', amount: t.amount, balanceAfter, plan: planId, ref: t.tx_ref });
+  await qualifyReferral(pl.user).catch(e => console.error('referral', e.message));   // a first saving can complete a referral
   return true;
 }
 const AutoSave = mongoose.model('AutoSave', new mongoose.Schema({
@@ -1735,11 +1906,24 @@ function nextRun(r, from = new Date()) {
 const ruleView = r => r && ({ amount: r.amount, freq: r.freq, hour: r.hour, weekday: r.weekday, day: r.day, status: r.status, cardLast4: r.cardLast4, cardBrand: r.cardBrand, nextRunAt: r.nextRunAt, failCount: r.failCount });
 const myPlan = (req) => Plan.findOne({ _id: req.params.id, user: req.user.id });
 
+// ---------- SAVINGS LIMIT ----------
+// Checked BEFORE the member pays, because money that has already reached Flutterwave cannot be refused afterwards.
+async function limitCheck(userId, incoming) {
+  const plans = await Plan.find({ user: userId }).select('balance');
+  const total = plans.reduce((t, p) => t + (p.balance || 0), 0);
+  // Referral money is free money on top of the cap: it does not count towards it.
+  const free = (await Referral.find({ referrer: userId, status: 'paid', withdrawnAt: { $exists: false } }).select('amount').lean()).reduce((t, r) => t + (r.amount || 0), 0);
+  const held = Math.max(0, total - free);
+  return checkRoom({ held, incoming, cap: capFor() });
+}
+const limitReply = (res, c) => res.status(403).json({ error: limitMessage(c.cap, c.room), code: 'LIMIT_REACHED', cap: c.cap, room: c.room });
+
 app.post('/api/plans/:id/fund', auth, async (req, res) => {       // add money to a plan any time, as often as you like
   const plan = await myPlan(req).catch(() => null), amount = Math.round(Number(req.body.amount));
   if (!plan) return res.status(404).json({ error: 'Plan not found.' });
   if (plan.paused) return res.status(403).json({ error: 'This plan is paused. Resume it before adding money.' });
   if (!(amount >= 100 && amount <= 5000000)) return res.status(400).json({ error: 'Enter an amount from ₦100 to ₦5,000,000.' });
+  const lim = await limitCheck(req.user.id, amount); if (!lim.ok) { log(req, 'LIMIT_BLOCKED', { where: 'plan_fund', amount }); return limitReply(res, lim); }
   const u = await User.findById(req.user.id);
   const txRef = `plan_${plan._id}_${Date.now()}`;
   const r = await flw('/payments', { tx_ref: txRef, amount, currency: 'NGN', redirect_url: payReturnUrl(),
@@ -1759,8 +1943,9 @@ app.post('/api/plans/:id/autosave', auth, async (req, res) => {
   if (!(amount >= 100 && amount <= 1000000) || !['daily', 'weekly', 'monthly'].includes(freq) || !(hour >= 0 && hour <= 23) || (freq === 'weekly' && !(weekday >= 0 && weekday <= 6)) || (freq === 'monthly' && !(day >= 1 && day <= 28)))
     return res.status(400).json({ error: 'Check the amount (₦100 to ₦1,000,000), how often, and the time.' });
   if (!tokKey()) return res.status(503).json({ error: 'Auto-save is not switched on yet. Please try again later.' });
+  const lim = await limitCheck(req.user.id, amount); if (!lim.ok) { log(req, 'LIMIT_BLOCKED', { where: 'autosave_setup', amount }); return limitReply(res, lim); }
   const hh = `${String(hour).padStart(2, '0')}:00`, when = freq === 'daily' ? `every day at ${hh}` : freq === 'weekly' ? `every ${['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][weekday]} at ${hh}` : `on day ${day} of every month at ${hh}`;
-  const consentText = `I allow CSave to charge my debit card ${ngn(amount)} ${when} and put it straight into my ${plan.title}. I can pause or cancel any time.`;
+  const consentText = `I allow CSave to charge my debit card ${ngn(amount)} ${when} and put it straight into my ${plan.title}. I can pause or cancel any time. ${limitNotice(lim.cap)}`;
   const fields = { user: req.user.id, amount, freq, hour, weekday: freq === 'weekly' ? weekday : undefined, day: freq === 'monthly' ? day : undefined, consentAt: new Date(), consentText };
   let rule = await AutoSave.findOne({ plan: plan._id });
   if (rule?.cardToken && req.body.keepCard) {                         // only the schedule changes: no new card needed
@@ -1812,6 +1997,12 @@ async function runAutoSaves() {                                         // check
       const [u, plan] = await Promise.all([User.findById(r.user).select('email'), Plan.findById(r.plan).select('user paused')]);
       if (!u || !plan || String(plan.user) !== String(r.user)) throw new Error('plan');
       if (plan.paused) continue;                                          // a paused plan takes no money: skip this run (no charge, no failure counted)
+      const lim = await limitCheck(r.user, r.amount);
+      if (!lim.ok) {                                                      // would go over the savings limit: do not charge, pause so the member is told once, not every run
+        await AutoSave.updateOne({ _id: r._id }, { status: 'paused' });
+        await Notif.create({ user: r.user, title: 'Auto-save paused', body: `Your next auto-save would take you above the ${ngn(lim.cap)} savings limit, so we did not charge your card and paused it.` });
+        continue;
+      }
       const autoRef = `plan_${r.plan}_auto_${r._id}_${Date.now()}`;
       await trackPayment(autoRef, 'auto_charge', r.user, r.amount);
       const res = await flw('/tokenized-charges', { token: decTok(r.cardToken), currency: 'NGN', country: 'NG', amount: r.amount, email: u.email, tx_ref: autoRef, narration: 'CSave auto-save' });
@@ -1843,83 +2034,6 @@ app.get('/api/media/:key', async (req, res) => {
 app.get('/api/announcements/banners', auth, async (req, res) => {       // recent announcement images for the Home banner
   const l = await Announcement.find({ images: { $not: { $size: 0 } }, createdAt: { $gte: new Date(Date.now() - 14 * 86400000) } }).sort('-createdAt').limit(3);
   res.json(l.flatMap(a => a.images.map(url => ({ url, title: a.title }))).slice(0, 6));
-});
-
-// ---------- WALLET ----------
-async function getOrCreateWallet(userId) {
-  return creditWallet(Wallet, userId, 0);                              // upsert, safe if two requests create it at once
-}
-async function creditWalletFund(d) {
-  const t = await verifyFlw(d.id);
-  const userId = String(d.tx_ref).split('_')[1];
-  if (!t || t.status !== 'successful' || t.currency !== 'NGN' || t.tx_ref !== d.tx_ref || !okId(userId) || !(await User.exists({ _id: userId }))) return false;
-  const flwId = String(t.id);
-  const { wallet, duplicate } = await creditWalletOnce(Wallet, userId, t.amount, 'flw_' + flwId);   // one atomic step, applied once per payment
-  await upsertOnce(Tx, { flwId }, { flwId, user: userId, kind: 'wallet_fund', amount: t.amount, status: 'ok' });
-  await upsertOnce(Ledger, { flwId }, { user: userId, kind: 'wallet_fund', amount: t.amount, balanceAfter: wallet?.balance, wallet: wallet?._id, ref: d.tx_ref });
-  if (!duplicate) await Notif.create({ user: userId, title: 'Wallet funded', body: `₦${Number(t.amount).toLocaleString()} was added to your wallet.` });
-  return true;
-}
-app.get('/api/wallet', auth, async (req, res) => {
-  const w = await getOrCreateWallet(req.user.id);
-  res.json({ balance: w.balance || 0 });
-});
-// The app sends the payment method the member picked. It decides which options Flutterwave shows.
-const PAY_OPTIONS = { card: 'card', ussd: 'ussd', bank: 'banktransfer', bank_transfer: 'banktransfer' };
-app.post('/api/wallet/fund', auth, async (req, res) => {
-  const amount = Math.round(Number(req.body.amount) * 100) / 100, method = String(req.body.method || 'card').toLowerCase();
-  if (!(amount >= 100 && amount <= 5000000)) return res.status(400).json({ error: 'Enter an amount from ₦100 to ₦5,000,000.' });
-  if (!(method in PAY_OPTIONS)) return res.status(400).json({ error: 'Pick card, USSD or bank transfer.' });
-  const u = await User.findById(req.user.id);
-  if (u.kycStatus !== 'approved') return res.status(403).json({ error: 'Complete your KYC first.' });
-  const txRef = `wallet_${u._id}_${Date.now()}`;
-  const r = await flw('/payments', {
-    tx_ref: txRef, amount, currency: 'NGN', payment_options: PAY_OPTIONS[method],
-    redirect_url: payReturnUrl(), customer: { email: u.email, name: u.name },
-    customizations: { title: 'CSave wallet fund' },
-  });
-  if (!r?.data?.link) return res.status(502).json({ error: 'Could not start payment. Try again.' });
-  trackPayment(txRef, 'wallet', u._id, amount);
-  log(req, 'WALLET_FUND_STARTED', { amount, method }); res.json({ link: r.data.link });
-});
-app.post('/api/wallet/transfer-to-plan', auth, async (req, res) => {
-  const amount = Number(req.body.amount), planId = req.body.planId;
-  if (!(amount > 0) || !planId) return res.status(400).json({ error: 'Pick a plan and an amount above zero.' });
-  const plan = await Plan.findOne({ _id: planId, user: req.user.id });
-  if (!plan) return res.status(404).json({ error: 'Plan not found.' });
-  if (plan.paused) return res.status(403).json({ error: 'This plan is paused. Resume it first.' });
-  const taken = await debitWallet(Wallet, req.user.id, amount);          // atomic: only if enough money is there
-  if (!taken) return res.status(400).json({ error: 'Insufficient wallet balance.' });
-  let credited = null;
-  try { credited = await creditPlan(Plan, plan._id, req.user.id, amount); } catch (e) { console.error('CREDIT PLAN FAILED', e.message); }   // atomic: only if the plan is not paused
-  if (!credited) {                                                       // plan could not take it (paused meanwhile): give the money back
-    try { await creditWallet(Wallet, req.user.id, amount); }
-    catch (e) {                                                          // refund failed too: the member's money is stuck, finance must fix it by hand
-      console.error('CRITICAL_REFUND_FAILED', req.user.id, amount, e.message);
-      alertOps('CRITICAL: wallet money not returned', `Member ${req.user.id} lost ${ngn(amount)} between wallet and plan ${plan._id}. Put the money back in the wallet by hand.`, 'crit_' + req.user.id + '_' + plan._id);
-      try { await Audit.create({ actor: req.user.id, role: req.user.role, action: 'CRITICAL_REFUND_FAILED', detail: { userId: String(req.user.id), amount, plan: String(plan._id) }, ip: req.ip }); }
-      catch (e2) { console.error('CRITICAL_REFUND_FAILED AUDIT WRITE FAILED', req.user.id, amount, e2.message); }
-      return res.status(500).json({ error: 'Something went wrong and your money was not returned automatically. Our finance team has been alerted and will fix it. Please contact support.' });
-    }
-    return res.status(409).json({ error: 'This plan could not take the money. Your wallet was not charged.' });
-  }
-  await Ledger.create({ user: req.user.id, kind: 'wallet_to_plan', amount, balanceAfter: taken.balance, plan: plan._id, wallet: taken._id, ref: `w2p_${Date.now()}` });
-  await Tx.create({ plan: plan._id, user: req.user.id, kind: 'wallet_to_plan', amount, status: 'ok' });   // internal move: not new cash, so it stays out of the cash totals
-  log(req, 'WALLET_TO_PLAN', { plan: plan._id, amount }); res.json({ ok: true, walletBalance: taken.balance, planBalance: credited.balance });
-});
-const MANUAL_CREDIT_MAX = Number(process.env.MANUAL_CREDIT_MAX) || 50000;
-app.post('/api/admin/wallet/:id/credit', auth, requireRole('admin', 'finance'), async (req, res) => {
-  const amount = Number(req.body.amount), note = String(req.body.note || '').trim().slice(0, 200);
-  if (!(amount > 0)) return res.status(400).json({ error: 'Amount must be above zero.' });
-  // Money created by hand needs a written reason and stays under a ceiling. Larger amounts are done by the Admin as a direct database adjustment.
-  if (note.length < 10) return res.status(400).json({ error: 'Write the reason for this credit (at least 10 characters).' });
-  if (amount > MANUAL_CREDIT_MAX) return res.status(403).json({ error: `Manual credits above ₦${MANUAL_CREDIT_MAX.toLocaleString()} require a direct database adjustment by the Admin.` });
-  const u = await User.findById(req.params.id);
-  if (!u || u.role !== 'customer') return res.status(404).json({ error: 'Member not found.' });
-  const w = await creditWallet(Wallet, u._id, amount);                 // one atomic step
-  await Ledger.create({ user: u._id, kind: 'admin_adjust', amount, balanceAfter: w.balance, wallet: w._id, by: req.user.id, meta: { note } });
-  await Notif.create({ user: u._id, title: 'Wallet credited', body: `Staff added ₦${amount.toLocaleString()} to your wallet.` });
-  log(req, 'ADMIN_WALLET_CREDIT', { member: u._id, amount }); res.json({ ok: true, balance: w.balance });
 });
 
 // ---------- PLAN EXTEND / PAUSE / RESUME ----------
@@ -2083,20 +2197,12 @@ app.get('/pay/return', payPageLimit, async (req, res) => {
   res.type('html').send(payPage({ ...page, backUrl: process.env.PAYMENT_BACK_URL }));
 });
 
-// ---------- BVN CHECK FOR KYC (Dojah) ----------
-// Returns the outcome for a BVN submission. A provider outage never blocks a member: the submission goes to staff marked "not checked".
-async function verifyBvnForKyc(bvn, accountName, dob) {
-  if (!process.env.DOJAH_APP_ID || !process.env.DOJAH_SECRET_KEY) return { result: 'off' };
-  try {
-    const rec = await lookupBvn(bvn);
-    lastBvnOkAt = Date.now();                                                // Dojah answered, even if it found nothing
-    if (!rec.found) return { result: 'notfound' };
-    return matchBvn(rec, accountName, dob);                                  // { result: 'match' } or { result: 'mismatch', reason }
-  } catch (e) {
-    lastBvnFailAt = Date.now();
-    console.error('BVN check unavailable:', e.message);
-    return { result: 'unchecked' };
-  }
+// ---------- AUTOMATIC ID CHECK FOR KYC (Dojah) ----------
+// The rules are in idcheck.js. A provider outage never blocks a member: the submission goes to staff marked "could not be checked".
+async function runIdCheck(args) {
+  const r = await checkKycId(args);
+  if (r.failed) lastBvnFailAt = Date.now(); else if (['match', 'mismatch', 'notfound'].includes(r.result)) lastBvnOkAt = Date.now();   // read by the health monitor
+  return r;
 }
 
 // ---------- HEALTH MONITOR (runs inside the server every 5 minutes, for as long as the app is live) ----------
