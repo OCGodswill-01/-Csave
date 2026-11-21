@@ -290,7 +290,6 @@ class _HomeState extends State<HomePage> {
             // No Transfer button by design. Withdraw lives inside each plan.
             Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
               _Action('Add money', Icons.add, orange, onTap: () => pickPlanAndAdd(context)),
-              _Action('Wallet', Icons.account_balance_wallet, Colors.tealAccent, onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const WalletScreen()))),
               const _Action('Converter', Icons.currency_exchange, Colors.blueAccent),
             ]),
             const SizedBox(height: 20),
@@ -595,11 +594,48 @@ String maskEmail(String e) {
   return '${e.substring(0, at == 1 ? 1 : 2)}•••${e.substring(at)}';
 }
 
+/// First letters of the first and last name, for the picture placeholder. Safe for any input.
+String initials(String n) {
+  final p = n.trim().split(RegExp(r'\s+')).where((x) => x.isNotEmpty).toList();
+  if (p.isEmpty) return '?';
+  return (p.first[0] + (p.length > 1 ? p.last[0] : '')).toUpperCase();
+}
+
 class _ProfileState extends State<ProfilePage> {
   late Future f = Api.call('GET', '/api/me');
   bool bio = false;
+  ImageProvider? avatar;   // the member's profile picture, if they set one
   @override
-  void initState() { super.initState(); Bio.enabled.then((v) => setState(() => bio = v)); }
+  void initState() { super.initState(); Bio.enabled.then((v) => setState(() => bio = v)); loadPhoto(); }
+
+  Future<void> loadPhoto() async {
+    try {
+      final r = await Api.call('GET', '/api/me/photo');
+      final p = r['photo'];
+      if (mounted) setState(() => avatar = p is String && p.contains(',') ? MemoryImage(base64Decode(p.split(',').last)) : null);
+    } catch (_) {}   // the picture is optional: the initials show instead
+  }
+
+  Future<void> changePhoto() async {
+    final pick = await showModalBottomSheet<String>(context: context, builder: (_) => SafeArea(child: Wrap(children: [
+          ListTile(leading: const Icon(Icons.photo_camera), title: const Text('Take a photo'), onTap: () => Navigator.pop(context, 'camera')),
+          ListTile(leading: const Icon(Icons.photo_library), title: const Text('Choose from gallery'), onTap: () => Navigator.pop(context, 'gallery')),
+          if (avatar != null) ListTile(leading: const Icon(Icons.delete_outline, color: Colors.redAccent), title: const Text('Remove photo'), onTap: () => Navigator.pop(context, 'remove')),
+        ])));
+    if (pick == null) return;
+    try {
+      if (pick == 'remove') {
+        await Api.call('DELETE', '/api/me/photo');
+        if (mounted) setState(() => avatar = null);
+        return;
+      }
+      final shot = await ImagePicker().pickImage(source: pick == 'camera' ? ImageSource.camera : ImageSource.gallery, maxWidth: 512, maxHeight: 512, imageQuality: 80);
+      if (shot == null) return;
+      final bytes = await shot.readAsBytes();
+      await Api.call('POST', '/api/me/photo', {'photo': 'data:image/jpeg;base64,${base64Encode(bytes)}'});
+      if (mounted) setState(() => avatar = MemoryImage(bytes));
+    } catch (e) { _snack(friendly(e)); }
+  }
 
   Future<void> toggle(bool v) async {
     if (v) {
@@ -635,6 +671,28 @@ class _ProfileState extends State<ProfilePage> {
     try { await Api.call('POST', '/api/me/pin', {'pin': p}); _snack('PIN saved.'); } catch (e) { _snack(friendly(e)); }
   }
 
+  // Google Play requires members to be able to delete their account from inside the app.
+  Future<void> deleteAccount() async {
+    final c = TextEditingController();
+    final pw = await showDialog<String>(context: context, builder: (_) => AlertDialog(
+          title: const Text('Delete my account?'),
+          content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('This permanently erases your profile, ID photos, notifications and saved details. It cannot be undone.\n\nYour savings plans must be empty first. Payment records are kept without your name, as financial rules require.'),
+            const SizedBox(height: 12),
+            TextField(controller: c, obscureText: true, decoration: const InputDecoration(labelText: 'Enter your password to confirm')),
+          ])),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+            FilledButton(style: FilledButton.styleFrom(backgroundColor: Colors.redAccent), onPressed: () => Navigator.pop(context, c.text), child: const Text('Delete my account')),
+          ]));
+    if (pw == null || pw.isEmpty) return;
+    try {
+      await Api.call('POST', '/api/me/delete-account', {'password': pw});
+      await Api.clearAccount();
+      if (mounted) Navigator.pushAndRemoveUntil(context, MaterialPageRoute(builder: (_) => const Entry()), (_) => false);
+    } catch (e) { _snack(friendly(e)); }
+  }
+
   void _snack(String m) { if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m))); }
 
   @override
@@ -645,9 +703,18 @@ class _ProfileState extends State<ProfilePage> {
           final d = s.data; final kyc = d['kycStatus'] == 'approved';
           final email = d['email'].toString();
           return ListView(padding: const EdgeInsets.all(16), children: [
-            Text(d['name'], style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
-            Text(maskEmail(email), style: const TextStyle(color: Colors.grey)),
+            Center(child: GestureDetector(onTap: changePhoto, child: Stack(children: [
+              CircleAvatar(radius: 44, backgroundImage: avatar, child: avatar == null ? Text(initials(d['name'].toString()), style: const TextStyle(fontSize: 30, fontWeight: FontWeight.bold)) : null),
+              Positioned(right: 0, bottom: 0, child: CircleAvatar(radius: 14, backgroundColor: orange, child: const Icon(Icons.camera_alt, size: 16, color: Colors.white))),
+            ]))),
+            const SizedBox(height: 10),
+            Center(child: Text(d['name'], style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold))),
+            Center(child: Text(maskEmail(email), style: const TextStyle(color: Colors.grey))),
             const SizedBox(height: 16),
+            Card(child: ListTile(leading: const Icon(Icons.badge_outlined), title: const Text('My details'), subtitle: const Text('See the information CSave holds about you'),
+                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const MyDetailsScreen())))),
+            Card(child: ListTile(leading: const Icon(Icons.group_add, color: orange), title: const Text('My referrals'), subtitle: const Text('People you referred, what you have earned and withdrawn'),
+                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const ReferralsScreen())))),
             Card(child: ListTile(
               leading: Icon(kyc ? Icons.verified : Icons.flag, color: kyc ? Colors.green : Colors.redAccent),
               title: Text(kyc ? 'KYC verified' : d['kycStatus'] == 'pending' ? 'KYC under review' : d['kycStatus'] == 'rejected' ? 'KYC needs attention' : 'KYC not complete'),
@@ -664,10 +731,126 @@ class _ProfileState extends State<ProfilePage> {
             Card(child: SwitchListTile(title: const Text('Fingerprint'), subtitle: const Text('Sign in and confirm withdrawals with your fingerprint'), value: bio, onChanged: toggle)),
             Card(child: ListTile(leading: const Icon(Icons.brightness_6), title: const Text('Light / dark mode'), trailing: Switch(value: Theme.of(context).brightness == Brightness.light, onChanged: (_) async { await toggleTheme(); setState(() {}); }))),
             Card(child: ListTile(leading: const Icon(Icons.pin), title: Text(d['hasPin'] ? 'Change withdrawal PIN' : 'Set withdrawal PIN'), onTap: setPin)),
+            Card(child: ListTile(leading: const Icon(Icons.delete_forever, color: Colors.redAccent), title: const Text('Delete my account'), subtitle: const Text('Erase your details and close your CSave account'), onTap: deleteAccount)),
             const SizedBox(height: 12),
             OutlinedButton(onPressed: () async { await Api.forgetDevice(); if (mounted) Navigator.pushAndRemoveUntil(context, MaterialPageRoute(builder: (_) => const Entry()), (_) => false); }, child: const Text('Sign out')),
           ]);
         },
+      );
+}
+
+// ---------------- MY DETAILS ----------------
+// Shows the member what CSave holds about them. The full ID number and the photos are never sent to the phone.
+class MyDetailsScreen extends StatefulWidget {
+  const MyDetailsScreen({super.key});
+  @override
+  State<MyDetailsScreen> createState() => _MyDetailsState();
+}
+
+class _MyDetailsState extends State<MyDetailsScreen> {
+  late Future f = Api.call('GET', '/api/me/details');
+  Map? revealed;   // the full details, only while this screen is open
+
+  // Sensitive rows stay hidden until the member enters their password.
+  Future<void> reveal() async {
+    String? pw;
+    // Fingerprint first, when the member turned it on in Profile: it releases the password kept safely on this phone.
+    if (await Bio.enabled && await Bio.available()) {
+      final saved = await store.read(key: 'bioPass');
+      if (saved != null && await Bio.prompt('Show your private details')) pw = saved;
+    }
+    if (pw == null) {
+      if (!mounted) return;
+      final c = TextEditingController();
+      pw = await showDialog<String>(context: context, builder: (_) => AlertDialog(
+            title: const Text('Confirm it is you'),
+            content: TextField(controller: c, obscureText: true, decoration: const InputDecoration(labelText: 'Enter your password')),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+              FilledButton(onPressed: () => Navigator.pop(context, c.text), child: const Text('Show')),
+            ]));
+    }
+    if (pw == null || pw.isEmpty) return;
+    try {
+      final r = await Api.call('POST', '/api/me/details/reveal', {'password': pw});
+      if (mounted) setState(() => revealed = r as Map);
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(friendly(e))));
+    }
+  }
+
+  Widget row(String label, dynamic value) => ListTile(
+        dense: true,
+        title: Text(label, style: const TextStyle(color: Colors.grey, fontSize: 13)),
+        subtitle: Text(value == null || value.toString().trim().isEmpty ? 'Not provided' : value.toString(), style: const TextStyle(fontSize: 16)),
+      );
+
+  Widget heading(String t) => Padding(padding: const EdgeInsets.fromLTRB(16, 20, 16, 4), child: Text(t, style: const TextStyle(color: orange, fontWeight: FontWeight.bold, fontSize: 15)));
+
+  String day(dynamic iso) {
+    final t = DateTime.tryParse(iso?.toString() ?? '');
+    if (t == null) return '';
+    final l = t.toLocal();
+    return '${l.day.toString().padLeft(2, '0')}/${l.month.toString().padLeft(2, '0')}/${l.year}';
+  }
+
+  String kycWords(dynamic s) => s == 'approved' ? 'Verified' : s == 'pending' ? 'Under review' : s == 'rejected' ? 'Needs attention' : 'Not submitted yet';
+
+  static const photoNames = {'selfie': 'Selfie holding your name', 'idFront': 'ID, front', 'idBack': 'ID, back', 'proof': 'Proof of address'};
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('My details')),
+        body: FutureBuilder(
+          future: f,
+          builder: (c, s) {
+            if (s.hasError) return Center(child: Padding(padding: const EdgeInsets.all(24), child: Text(friendly(s.error!), textAlign: TextAlign.center)));
+            if (!s.hasData) return const Center(child: CircularProgressIndicator());
+            final d = revealed ?? s.data;
+            final k = d['kyc'];
+            final locked = d['locked'] != false;
+            String hide(dynamic v) => locked ? '••••••••' : (v == null ? '' : v.toString());
+            final photos = (d['photosOnFile'] as List?) ?? [];
+            return ListView(children: [
+              heading('Account'),
+              row('Full name', d['name']),
+              row('Email address', d['email']),
+              row('Member since', day(d['memberSince'])),
+              if (d['membershipPaid'] == true) row('Membership ID', d['membershipId']),
+              row('KYC status', kycWords(d['kycStatus'])),
+              heading('KYC details you submitted'),
+              if (k != null && locked)
+                Padding(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6), child: FilledButton.icon(onPressed: reveal, icon: const Icon(Icons.lock_open), label: const Text('Show hidden details'))),
+              if (k != null && !locked)
+                Padding(padding: const EdgeInsets.symmetric(horizontal: 16), child: Align(alignment: Alignment.centerLeft, child: TextButton.icon(onPressed: () => setState(() => revealed = null), icon: const Icon(Icons.lock), label: const Text('Hide again')))),
+              if (k == null)
+                const Padding(padding: EdgeInsets.all(16), child: Text('You have not submitted your KYC details yet.'))
+              else ...[
+                row('Phone number', hide(k['phone'])),
+                row('Address', hide(k['address'])),
+                row('Date of birth', hide(k['dob'])),
+                row('Gender', k['gender']),
+                row('Marital status', k['maritalStatus']),
+                row('Occupation', k['occupation']),
+                row('Place of origin', hide(k['placeOfOrigin'])),
+                row('ID type', k['idType']),
+                row('ID number', locked ? '••••••••' : (k['idLast4'] == null ? null : 'Ending in ${k['idLast4']}')),
+                row('Next of kin', hide(k['nextOfKin'])),
+                row('Proof of address', k['proofOfAddress']),
+                row('Submitted on', day(k['submittedAt'])),
+              ],
+              heading('Photos on file'),
+              if (photos.isEmpty)
+                const Padding(padding: EdgeInsets.all(16), child: Text('No KYC photos yet.'))
+              else
+                for (final p in photos) ListTile(dense: true, leading: const Icon(Icons.check_circle, color: Colors.green, size: 20), title: Text(photoNames[p] ?? p.toString())),
+              const Padding(
+                padding: EdgeInsets.all(16),
+                child: Text('Private details stay hidden until you confirm with your password. Your full ID number and your photos are stored encrypted and can be seen only by authorised CSave staff. To correct a detail, contact customer service. To erase everything, use Delete my account in Profile.', style: TextStyle(color: Colors.grey, fontSize: 13)),
+              ),
+            ]);
+          },
+        ),
       );
 }
 
@@ -682,6 +865,16 @@ class _KycState extends State<KycScreen> {
   final f = {for (var k in ['phone', 'residentialAddress', 'placeOfOrigin', 'occupation', 'dob', 'idNumber', 'nextOfKin']) k: TextEditingController()};
   String idType = 'NIN'; String? err; bool busy = false;
   String? gender, marital, proof;
+  bool limitAck = false; int cap = 300000;   // savings limit the member must confirm; the server sends the real number
+
+  @override
+  void initState() {
+    super.initState();
+    Api.call('GET', '/api/me').then((d) { final c = d['savingsCap']; if (c is num && mounted) setState(() => cap = c.round()); }).catchError((_) {});
+  }
+
+  String get capText => '₦${cap.toString().replaceAllMapped(RegExp(r'\B(?=(\d{3})+(?!\d))'), (m) => ',')}';
+
   // Camera photos only: selfie holding a paper with the name, front and back of the ID, and the bill chosen above.
   final Map<String, Uint8List> photos = {};
   static const slots = ['selfie', 'idFront', 'idBack', 'proof'];
@@ -700,11 +893,12 @@ class _KycState extends State<KycScreen> {
   Future<void> submit() async {
     if (proof == null) { setState(() => err = 'Choose the type of bill first.'); return; }
     if (slots.any((s) => !photos.containsKey(s))) { setState(() => err = 'Take all four photos before you submit.'); return; }
+    if (!limitAck) { setState(() => err = 'Tick the box to confirm you have read the savings limit.'); return; }
     setState(() { busy = true; err = null; });
     try {
       await Api.call('POST', '/api/kyc', {
         for (var e in f.entries) e.key: e.value.text.trim(),
-        'idType': idType, 'gender': gender, 'maritalStatus': marital, 'proofOfAddress': proof,
+        'idType': idType, 'limitAck': true, 'gender': gender, 'maritalStatus': marital, 'proofOfAddress': proof,
         'photos': {for (var e in photos.entries) e.key: 'data:image/jpeg;base64,${base64Encode(e.value)}'},
       });
       if (mounted) { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('KYC submitted. We will review it.'))); Navigator.pop(context); }
@@ -773,6 +967,12 @@ class _KycState extends State<KycScreen> {
           _photo('idBack', '3. Back of your ID'),
           _photo('proof', proof == null ? '4. Choose the bill type above first' : '4. Photo of your $proof'),
           const Text('Your ID number and photos are stored encrypted. Staff open them only to check your identity. Staff lists show just the last 4 digits.', style: TextStyle(color: Colors.grey, fontSize: 12)),
+          const SizedBox(height: 8),
+          CheckboxListTile(
+            contentPadding: EdgeInsets.zero, controlAffinity: ListTileControlAffinity.leading, value: limitAck,
+            onChanged: busy ? null : (v) => setState(() { limitAck = v ?? false; err = null; }),
+            title: Text('I understand that for now I cannot keep more than $capText in total in CSave. CSave will not accept a payment that takes me above it. The limit will be raised later.', style: const TextStyle(fontSize: 13)),
+          ),
           if (err != null) Padding(padding: const EdgeInsets.only(top: 10), child: Text(err!, style: const TextStyle(color: Colors.redAccent))),
           const SizedBox(height: 16),
           FilledButton(style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(52)), onPressed: busy ? null : submit, child: const Text('Submit KYC')),
@@ -834,6 +1034,8 @@ class _MemState extends State<MembershipScreen> {
             ] else ...[
               const Text('₦5,000', style: TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: orange)),
               const Text('One-time compulsory membership fee. Terms and conditions apply.'),
+              const SizedBox(height: 8),
+              Text((d['limitNotice'] ?? 'Savings limit: for now you cannot keep more than ₦300,000 in total in CSave.').toString(), style: const TextStyle(color: Colors.grey, fontSize: 12)),
               const SizedBox(height: 12),
               Text(d['kycStatus'] == 'none' || d['kycStatus'] == 'rejected' ? 'Submit your KYC first. Go to Profile, then KYC.' : 'After you pay, your membership ID appears in your notifications and in your email.'),
               if (err != null) Padding(padding: const EdgeInsets.only(top: 10), child: Text(err!, style: const TextStyle(color: Colors.redAccent))),
@@ -912,3 +1114,67 @@ class _ForgotState extends State<ForgotScreen> {
         ]),
       );
 }
+
+// ---------------- MY REFERRALS (read only) ----------------
+String refNaira(num n) => '₦' + n.round().toString().replaceAllMapped(RegExp(r'\B(?=(\d{3})+(?!\d))'), (m) => ',');
+
+class ReferralsScreen extends StatefulWidget {
+  const ReferralsScreen({super.key});
+  @override
+  State<ReferralsScreen> createState() => _ReferralsState();
+}
+
+class _ReferralsState extends State<ReferralsScreen> {
+  late Future<dynamic> f = Api.call('GET', '/api/me/referrals');
+
+  String _status(String s) => {'waiting': 'Waiting', 'credited': 'Credited to your plan', 'withdrawn': 'Withdrawn', 'skipped': 'Not counted'}[s] ?? s;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('My referrals')),
+      body: FutureBuilder(
+        future: f,
+        builder: (c, s) {
+          if (s.hasError) return const Center(child: Text('Could not load your referrals. Pull to try again.'));
+          if (!s.hasData) return const Center(child: CircularProgressIndicator());
+          final d = s.data as Map;
+          final t = d['totals'] as Map;
+          final rows = d['referrals'] as List;
+          final wds = d['withdrawals'] as List;
+          return ListView(padding: const EdgeInsets.all(16), children: [
+            Text(d['ruleText'].toString(), style: const TextStyle(color: Colors.grey)),
+            const SizedBox(height: 12),
+            Card(child: Padding(padding: const EdgeInsets.all(16), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Balance in your plans: ${refNaira(t['balance'])}', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 6),
+              Text('Earned so far: ${refNaira(t['earned'])}'),
+              Text('Withdrawn so far: ${refNaira(t['withdrawn'])}'),
+              Text('People referred: ${t['referred']} · credited: ${t['credited']} · waiting: ${t['waiting']}'),
+              if ((t['waiting'] as num) > 0) Text('Waiting ones will be worth ${refNaira(t['waitingValue'])} once they qualify.'),
+            ]))),
+            const SizedBox(height: 12),
+            const Text('Your referrals', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+            if (rows.isEmpty) const Padding(padding: EdgeInsets.all(12), child: Text('No one yet. Share your referral code from Home.')),
+            ...rows.map((r) => Card(child: ListTile(
+                  title: Text('${r['name']} · ${refNaira(r['amount'])}'),
+                  subtitle: Text([
+                    _status(r['status'].toString()),
+                    if (r['plan'] != null) 'in ${r['plan']}',
+                    if (r['status'] == 'waiting' && r['reason'] != null && r['reason'].toString().isNotEmpty) r['reason'].toString(),
+                  ].join(' · ')),
+                ))),
+            const SizedBox(height: 12),
+            const Text('Withdrawals of referral money', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+            if (wds.isEmpty) const Padding(padding: EdgeInsets.all(12), child: Text('None yet.')),
+            ...wds.map((w) => Card(child: ListTile(
+                  title: Text(refNaira(w['amount'])),
+                  subtitle: Text('${w['count']} referral${w['count'] == 1 ? '' : 's'} · ${w['at'].toString().substring(0, 10)}'),
+                ))),
+          ]);
+        },
+      ),
+    );
+  }
+}
+
