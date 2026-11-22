@@ -169,6 +169,7 @@ const auth = async (req, res, next) => {
 };
 const requireRole = (...roles) => (req, res, next) =>
   roles.includes(req.user.role) ? next() : res.status(403).json({ error: 'Not allowed for your role.' });
+const only = (...roles) => [auth, requireRole('admin', ...roles)];   // the admin can always see everything
 // One limiter per job. (They used to share ONE counter, so register + login + forgot + withdraw + staff routes all drew
 // from the same 20 requests per IP, and a shared mobile-network IP could lock out everyone.)
 // NOTE: the counters live in this server's memory. If you run more than one server instance, move them to Redis.
@@ -1392,7 +1393,6 @@ app.post('/api/coach/chat', auth, aiGate, rateLimit({ windowMs: 60000, max: 20 }
 const STAFF = ['admin', 'finance', 'operations', 'support', 'tech'];
 const ROLE_LABEL = { admin: 'Administrator', finance: 'Finance', operations: 'Operations and Analytics', support: 'Customer Service', tech: 'Technical' };
 const anyStaff = [auth, requireRole(...STAFF)];
-const only = (...roles) => [auth, requireRole('admin', ...roles)];   // the admin can always see everything
 const sha = s => crypto.createHash('sha256').update(s).digest('hex');
 const AiNote = mongoose.model('AiNote', new mongoose.Schema({ kind: { type: String, default: 'coach' }, text: String, by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' } }, { timestamps: true }));
 const Config = mongoose.model('Config', new mongoose.Schema({
