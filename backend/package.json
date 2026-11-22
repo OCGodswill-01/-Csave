@@ -5,7 +5,7 @@
   "scripts": {
     "start": "node server.js",
     "seed": "node seed-demo.js",
-    "test": "node --test test/money.test.js test/referral.test.js test/changes.test.js test/bvn.test.js test/health.test.js"
+    "test": "node --test test/money.test.js test/referral.test.js test/changes.test.js test/bvn.test.js test/health.test.js test/account-delete.test.js test/member-details.test.js test/idcheck.test.js test/limits.test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -16,6 +16,6 @@
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.5.0",
-    "node-cron": "^4.6.0"
+    "node-cron": "^3.0.3"
   }
 }
