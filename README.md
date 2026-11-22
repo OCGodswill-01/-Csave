@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/35221082/README.md)
+[README.md](https://github.com/user-attachments/files/35245790/README.md)
 
 ## Keys (server .env only, never in the app)
 DEEPSEEK_API_KEY  -> AI customer service (/api/ai/chat)
