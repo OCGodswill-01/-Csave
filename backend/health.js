@@ -22,8 +22,8 @@ const ENV_RULES = [
   { name: 'PAYMENT_RETURN', label: 'Payment return page (PAYMENT_REDIRECT_URL or PUBLIC_BASE_URL)', severity: 'warning',
     why: 'Members are not sent back to the CSave payment page after they pay.',
     fix: 'Set PAYMENT_REDIRECT_URL to https://your-server-address/pay/return' },
-  { name: 'DOJAH_KEYS', label: 'BVN checking (DOJAH_APP_ID and DOJAH_SECRET_KEY)', severity: 'warning',
-    why: 'BVN numbers are accepted without being checked against the register.',
+  { name: 'DOJAH_KEYS', label: 'Automatic ID checking (DOJAH_APP_ID and DOJAH_SECRET_KEY)', severity: 'warning',
+    why: 'IDs are not checked automatically. Staff verify every NIN by hand until the Dojah keys are set.',
     fix: 'Set DOJAH_APP_ID and DOJAH_SECRET_KEY in Render.' },
   { name: 'TELEMETRY_KEY', label: 'App reporting key (TELEMETRY_KEY)', severity: 'info',
     why: 'Crashes and session counts from the app are not recorded.',
@@ -77,8 +77,8 @@ function evaluateHealth(s) {
     `${plural(s.kycOverdue, 'KYC submission has', 'KYC submissions have')} waited more than 3 days`,
     'Members with KYC waiting cannot withdraw or unlock referrals.',
     'Operations: review them in Members.');
-  if (s.bvnFailing) add('bvn.failing', 'warning', 'Verification', 'BVN checks are failing',
-    'Dojah did not answer properly in the last 24 hours, so new BVN submissions are going to staff unchecked.',
+  if (s.bvnFailing) add('bvn.failing', 'warning', 'Verification', 'Automatic ID checks are failing',
+    'Dojah did not answer properly in the last 24 hours, so new KYC submissions are going to staff unchecked.',
     'Check the Dojah dashboard: the keys, the account balance and the service status.');
 
   // Auto-save
