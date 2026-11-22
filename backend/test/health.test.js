@@ -46,7 +46,7 @@ test('a missing critical setting is reported with its fix', () => {
   assert.equal(overallStatus([i]), 'red');
 });
 
-test('a missing BVN key is a warning, and is reported with the Dojah name', () => {
+test('missing Dojah keys are a warning, and is reported with the Dojah name', () => {
   const issues = evaluateHealth({ ...healthy(), env: { ...allEnvSet, DOJAH_KEYS: false } });
   const i = issues.find(x => x.key === 'cfg.DOJAH_KEYS');
   assert.equal(i.severity, 'warning');
