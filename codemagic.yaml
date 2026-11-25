@@ -62,6 +62,7 @@ workflows:
       flutter: stable
       groups:
         - csave_app
+        - Firebase
     scripts:
       - name: Create web project and environment file
         script: |
@@ -77,6 +78,13 @@ workflows:
         script: flutter analyze --no-fatal-infos --no-fatal-warnings lib
       - name: Build web
         script: flutter build web --release
+      - name: Deploy to Firebase
+        script: |
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT" > $CM_BUILD_DIR/sa.json
+          export GOOGLE_APPLICATION_CREDENTIALS=$CM_BUILD_DIR/sa.json
+          printf '{"hosting":{"public":"build/web","rewrites":[{"source":"**","destination":"/index.html"}]}}' > firebase.json
+          npm install -g firebase-tools
+          firebase deploy --only hosting --project csave-web-app
       - name: Pack the web build into one zip
         script: cd build/web && zip -r ../web.zip .
     artifacts:
